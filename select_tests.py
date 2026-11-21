@@ -83,6 +83,7 @@ def parse_patch(text):
                 if line.startswith("\\"):
                     continue
                 if line.startswith(" ") or line == "":
+                    cur.setdefault("ctx", {})[o] = line[1:]
                     o += 1; rem_old -= 1; rem_new -= 1; run_minus = []; plus_seen = 0
                     continue
             rem_old = rem_new = 0  # malformed hunk: fall through to header parsing
@@ -609,7 +610,7 @@ def _src(f):
 def rebuild(old, info):
     """the patched file, or None when the patch does not fit the pinned source"""
     lines = old.split("\n")
-    for n, t in info["minus"].items():
+    for n, t in list(info["minus"].items()) + list(info.get("ctx", {}).items()):
         if n < 1 or n > len(lines) or lines[n - 1] != t:
             return None
     out = []
@@ -661,65 +662,87 @@ def _future_ann(tree):
                for n in tree.body)
 
 
-def _segment(f, old, info):
-    """old and new text of the smallest def / class / statement that holds every change, dedented;
-    None when there is none (then the whole file is compared)"""
-    touched = list(info["old"]) + list(info["ins"])
-    if not touched:
-        return None
-    lo = min(touched); hi = max(touched)
-    lines = old.split("\n")
+def _clusters(info, gap=3):
+    pts = sorted(set(info["old"]) | set(info["ins"]))
+    out = []
+    for n in pts:
+        if out and n - out[-1][-1] <= gap: out[-1].append(n)
+        else: out.append([n])
+    return out
+
+
+def _segment(f, lines, info, lo, hi, limit=600):
+    """old and new text (dedented) of the smallest def / class / statement holding the changes at old
+    lines lo..hi; None when there is no such span of at most `limit` lines"""
+    olds_ = [n for n in info["old"] if lo <= n <= hi]; ins_ = [k for k in info["ins"] if lo <= k <= hi]
     for a, b in _load_src()["spans"].get(f, ()):
-        # removed lines strictly after the header; insertions before a line inside the span
-        if not (a < lo and all(a < n <= b for n in info["old"]) and all(a < k <= b for k in info["ins"])):
+        if b - a > limit:
+            return None  # spans are sorted smallest first
+        # removed lines inside the span (header included); insertions after the header, up to just
+        # past its last line (a replaced last line, or lines appended to it)
+        if not (all(a <= n <= b for n in olds_) and all(a < k <= b + 1 for k in ins_)):
             continue
         ind = lines[a - 1][:len(lines[a - 1]) - len(lines[a - 1].lstrip())]
-        changed = [info["minus"][n] for n in info["old"]] + [t for ts in info["ins"].values() for t in ts]
+        changed = [info["minus"][n] for n in olds_] + [t for k in ins_ for t in info["ins"][k]]
         if any(t.strip() and not t.startswith(ind) for t in changed):
             return None
-        olds = lines[a - 1:b]
         news = []
         for n in range(a, b + 1):
             news.extend(info["ins"].get(n, ()))
             if n not in info["old"]:
                 news.append(lines[n - 1])
+        news.extend(info["ins"].get(b + 1, ()))
         cut = lambda xs: "\n".join(x[len(ind):] if x.startswith(ind) else x for x in xs)
-        return cut(olds), cut(news)
+        return cut(lines[a - 1:b]), cut(news)
     return None
 
 
 def file_verdict(f, info):
     """"all": the patched file no longer parses, so importing it fails; "none": same program
-    (comments, formatting, docstrings, unevaluated annotations); None: look at the lines."""
+    (comments, formatting, docstrings, unevaluated annotations); None: look at the lines.
+    Each cluster of changes is compared inside its smallest enclosing def / statement; the whole
+    file is parsed only when that is not possible or a piece does not parse."""
     old = _src(f)
     if old is None or info.get("deleted") or info.get("new_file"):
         return None
     new = rebuild(old, info)
     if new is None:
         return None
-    seg = _segment(f, old, info)
-    if seg is not None:
-        a_txt, b_txt = seg
+    lines = old.split("\n")
+    strip = bool(_FUTURE_ANN.search(old))
+    same = True; need_full = False
+    for cl in _clusters(info):
+        seg = _segment(f, lines, info, cl[0], cl[-1])
+        if seg is None and not any(n in info["old"] for n in cl):
+            # pure insertion between statements (a new method, say): the block alone, at the
+            # indentation of the line it lands before
+            ins = [t for k in cl for t in info["ins"].get(k, ())]
+            body = [t for t in ins if t.strip()]
+            nxt = next((lines[n - 1] for n in range(cl[-1], len(lines) + 1) if lines[n - 1].strip()), "")
+            ind = nxt[:len(nxt) - len(nxt.lstrip())]
+            if body and all(t.startswith(ind) for t in body) and body[0][len(ind):len(ind) + 1] not in (" ", "\t"):
+                if all(t.strip().startswith("#") for t in body):
+                    continue
+                try:
+                    _ast.parse("\n".join(t[len(ind):] if t.startswith(ind) else t for t in ins))
+                    same = False; continue
+                except (SyntaxError, ValueError):
+                    pass
+        if seg is None:
+            need_full = True; same = False; continue
         try:
-            t_a = _ast.parse(a_txt); t_b = _ast.parse(b_txt)
+            t_a = _ast.parse(seg[0]); t_b = _ast.parse(seg[1])
         except (SyntaxError, ValueError):
-            pass  # decide on the whole file below
-        else:
-            strip = bool(_FUTURE_ANN.search(old))
-            if _ast.dump(_Norm(strip).visit(t_a)) == _ast.dump(_Norm(strip).visit(t_b)):
-                return "none"
-            return None
-    try:
-        t_new = _ast.parse(new)
-    except (SyntaxError, ValueError):
-        return "all"
-    try:
-        t_old = _ast.parse(old)
-    except SyntaxError:
-        return None
-    strip = _future_ann(t_old) and _future_ann(t_new)
-    if _ast.dump(_Norm(strip).visit(t_old)) == _ast.dump(_Norm(strip).visit(t_new)):
+            need_full = True; same = False; continue
+        if _ast.dump(_Norm(strip).visit(t_a)) != _ast.dump(_Norm(strip).visit(t_b)):
+            same = False
+    if same:
         return "none"
+    if need_full:
+        try:
+            _ast.parse(new)
+        except (SyntaxError, ValueError):
+            return "all"
     return None
 
 
