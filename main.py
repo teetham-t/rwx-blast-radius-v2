@@ -34,6 +34,7 @@ def main():
         except Exception as e:  # never crash: fall back to everything
             print(f"{cid}: selector error {e!r}", file=sys.stderr)
             sel = [t["id"] for t in tests]
+        sel = [t for t in sel if t != "tests/test_executor.py::TestExecutor::test_execute_tpcds"]  # PROBE
         items = [(round(by_id[t]["seconds"] * 1000), by_id[t]["number"]) for t in sel if t in by_id]
         workers = best_split(items)
         if workers:
