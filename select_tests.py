@@ -472,6 +472,9 @@ def select_mask(patch_text):
                 # expression node settings (arg_types, names, flags): every test that builds such a node
                 sel |= expr_mask(inner[3][0] if inner[2] == "attr" else inner[3])
                 continue
+            if inner and inner[2] == "attr" and inner[3][0].rsplit(".", 1)[-1] in ENUMS:
+                sel |= _enum_member_mask(f, ln, txt, is_ins, info, inner[3][0], inner[3][1])
+                continue
             if inner and inner[2] == "attr":
                 cq, attr, ents = inner[3]
                 keys = []
@@ -536,14 +539,59 @@ def select_mask(patch_text):
             # 4) module level statement (constant / helper table): tests running lines that use the name
             mn = re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=]*)?=", txt)
             if mn:
-                sel |= source_lines_mentioning([mn.group(1)])
+                sel |= source_lines_mentioning(sorted(_derived_names(f, mn.group(1))))
             else:
                 enclosing_assign = [x for x in MODULE_ASSIGNS.get(f, ()) if x[0] <= ln <= x[1]]
                 if enclosing_assign:
-                    sel |= source_lines_mentioning([enclosing_assign[-1][2]])
+                    key = key_of_text(stripped)
+                    if key:
+                        # one entry of a module-level table (a registry, say): what uses that key
+                        sel |= source_lines_mentioning([enclosing_assign[-1][2]]) | _key_users(key)
+                    else:
+                        sel |= source_lines_mentioning(sorted(_derived_names(f, enclosing_assign[-1][2])))
                 else:
                     sel |= lm.get(ln, 0)
     return sel
+
+
+def _derived_names(f, name):
+    """name plus module-level names in f computed from it (MODULE_BY_X = {... for n in X}), transitively:
+    their values are fixed at import, so only the code that reads them later shows in coverage"""
+    names = {name}; src = (_src(f) or "").split("\n")
+    grew = True
+    while grew and src:
+        grew = False
+        pat = re.compile(r"\b(" + "|".join(map(re.escape, sorted(names))) + r")\b")
+        for a, b, n in MODULE_ASSIGNS.get(f, ()):
+            if n in names: continue
+            text = "\n".join(src[a - 1:b])
+            rhs = text.split("=", 1)[1] if "=" in text else text
+            if pat.search(rhs):
+                names.add(n); grew = True
+    return names
+
+
+def _key_users(key):
+    m = tests_mentioning([key])
+    for c, cm in CLS_USE.items():
+        if c.rsplit(".", 1)[-1] == key: m |= cm
+    return m
+
+
+def _enum_member_mask(f, ln, txt, is_ins, info, cq, attr):
+    """an enum member: removing or renaming one that other code references breaks every module that
+    names it (at import); a new value changes lookups by value (Dialects.DORIS = "doris")"""
+    new = None if is_ins else info["pair"].get(ln)
+    if not is_ins and (new is None or not re.match(r"\s*%s\s*[:=]" % re.escape(attr), new)):
+        pat = re.compile(r"\.%s\b" % re.escape(attr))
+        if any(pat.search(t) for t in _load_src()["src"].values()):
+            return _everything()
+    vals = [a or b for a, b in STR.findall(txt + "\n" + (new or ""))]
+    m = tests_mentioning(vals + [attr]) | source_lines_mentioning([attr]) | class_use(cq)
+    low = {v.lower() for v in vals} | {attr.lower()}
+    for c, cm in CLS_USE.items():
+        if c.rsplit(".", 1)[-1].lower() in low: m |= cm  # Dialects.DORIS = "doris" -> the Doris dialect
+    return m
 
 
 import json as _json
