@@ -69,3 +69,9 @@ for f, text in _s.items():
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     with open(dst, "w", encoding="utf-8") as fh:
         fh.write(text)
+
+# baseline for the test_execute_tpcds gate, computed with the pinned tree (same code as the runtime check)
+import subprocess, sys
+subprocess.run([sys.executable, "-S", os.path.join(HERE, "tpcds_gate_child.py"), os.path.join(HERE, "sg"),
+                os.path.join(HERE, "tpcds_gate.json.gz"), os.path.join(HERE, "tpcds_base.json")], check=True,
+               stderr=subprocess.DEVNULL)

@@ -1069,14 +1069,21 @@ def _install_finder(table):
 
 
 def _child_import(table, mods):
-    """in a forked child: import mods with the patched files swapped in; exits 0 / 1, never returns"""
+    """in a forked child: import mods with the patched files swapped in (or, for mods == ["@tpcds"],
+    check the TPC-DS optimize hashes); exits 0 / 1, never returns"""
     try:
         import signal
-        signal.alarm(30)
+        signal.alarm(30 if mods != ["@tpcds"] else 60)
         dn = os.open(os.devnull, os.O_WRONLY)
         os.dup2(dn, 1); os.dup2(dn, 2)
         import importlib
         table.update(_child_import.pending)
+        if mods == ["@tpcds"]:
+            g = _gate()
+            sys.path.insert(1, HERE)
+            import tpcds_gate_child
+            _, ok = tpcds_gate_child.hashes(g["queries"], g["schema"], stop_at=g["base"])
+            os._exit(0 if ok else 1)
         for m in mods:
             importlib.import_module(m)
         os._exit(0)
@@ -1264,6 +1271,66 @@ def _module_broken_mask(f):
     return m
 
 
+# ---- test_execute_tpcds (21 s): drop it when the patch can only change what optimize() returns, and
+# optimize() returns the same trees for every TPC-DS query the test executes ----
+TPCDS_EXEC = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+_GATE = None
+_GATE_SPENT = [0.0]
+GATE_BUDGET = 45.0  # seconds of gate checks per batch at most (the batch has 3 minutes)
+
+
+def _gate():
+    global _GATE
+    if _GATE is None:
+        try:
+            import json as j
+            g = j.loads(gzip.decompress(open(os.path.join(HERE, "tpcds_gate.json.gz"), "rb").read()))
+            g["outside"] = {f: set(v) for f, v in g["outside"].items()}
+            g["base"] = j.load(open(os.path.join(HERE, "tpcds_base.json")))
+            if len(g["base"]) != len(g["queries"]):
+                raise ValueError
+            _GATE = g
+        except Exception:
+            _GATE = False
+    return _GATE
+
+
+def tpcds_gate_drops(files):
+    """True when every change sits inside function bodies that test_execute_tpcds runs only inside
+    optimize() (not in its setup, parsing, planning, execution or duckdb comparison), and optimize()
+    still returns identical trees (classes, args, types) for every query the test executes"""
+    G = _gate()
+    if not G or _GATE_SPENT[0] > GATE_BUDGET:
+        return False
+    patched = {}
+    for f, info in files.items():
+        if not (f.startswith("sqlglot/") and f.endswith(".py")) or info.get("deleted") or info.get("new_file"):
+            return False
+        v = file_verdict(f, info)
+        if v == "none":
+            continue
+        if v == "all":
+            return False
+        spans = SPANS.get(f, ())
+        if not all(any(a < x <= b for a, b, _ in spans) for x in set(info["old"]) | set(info["ins"])):
+            return False
+        out = G["outside"].get(f, ())
+        if any(x in out for x in set(info["old"]) | set(info["ins"]) | {k - 1 for k in info["ins"]}):
+            return False
+        new = rebuild(_src(f), info)
+        if new is None:
+            return False
+        patched[f] = new
+    if not patched:
+        return False
+    import time
+    t0 = time.time()
+    try:
+        return not _imports_fail(patched, ["@tpcds"])
+    finally:
+        _GATE_SPENT[0] += time.time() - t0
+
+
 LAZY_LOAD = "tests/dialects/test_dialect.py::TestDialect::test_lazy_load"
 TYPING_META = "tests/test_typing.py::TestTyping::test_no_redundant_expression_metadata"
 SQLGLOTC = ["tests/test_sqlglotc.py::TestSQLGlotC::test_build_removes_obsolete_extensions",
@@ -1303,11 +1370,19 @@ def select(patch_text):
     EXTRA_IDS.clear(); _VERDICTS.clear()
     files = parse_patch(patch_text)
     sel = select_mask(patch_text, files)
+    widened = 0
     try:
-        sel |= import_time_mask(files, sel)
+        widened = import_time_mask(files, sel)
+        sel |= widened
     except Exception:
-        pass
+        widened = -1
     res = [TESTS[i] for i in range(len(TESTS)) if sel >> i & 1]
+    if TPCDS_EXEC in res and not widened:
+        try:
+            if tpcds_gate_drops(files):
+                res.remove(TPCDS_EXEC)
+        except Exception:
+            pass
     res += [t for t in sorted(EXTRA_IDS) if t not in set(res)]
     try:
         for x in extra_tests(patch_text):

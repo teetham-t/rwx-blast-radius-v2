@@ -3,3 +3,4 @@ src.pkl
 __pycache__/
 words.pkl
 sg/
+tpcds_base.json
