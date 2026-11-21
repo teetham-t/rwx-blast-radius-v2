@@ -71,7 +71,7 @@ def parse_patch(text):
     """old line numbers removed ("minus"), lines inserted before old line n ("ins"), and which
     removed line each inserted line replaces ("pair"). Hunk line counts are honoured, so a removed
     line that starts with "-- " (SQL comment) is never taken for a file header."""
-    files = {}; cur = None; o = 0; prev_path = None
+    files = {}; cur = None; o = 0; prev_path = None; git_path = None
     rem_old = rem_new = 0; run_minus = []; plus_seen = 0
     for line in text.split("\n"):
         if rem_old > 0 or rem_new > 0:
@@ -95,7 +95,15 @@ def parse_patch(text):
                     continue
             rem_old = rem_new = 0  # malformed hunk: fall through to header parsing
         if line.startswith("diff --git"):
-            cur = None; continue
+            cur = None
+            md = re.match(r"diff --git a/(\S+) b/(\S+)", line)
+            git_path = md.group(2) if md else None
+            if git_path:
+                files.setdefault(git_path, _new_entry())  # also binary / mode-only changes (no hunks)
+            continue
+        if line.startswith("deleted file mode") and git_path:
+            files.setdefault(git_path, _new_entry())["deleted"] = True
+            continue
         if line.startswith("rename from ") or line.startswith("copy from "):
             # the old path stops existing (rename): every test that used it may break
             p = line.split(" ", 2)[2].strip()
