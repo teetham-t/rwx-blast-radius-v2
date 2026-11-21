@@ -237,9 +237,31 @@ def class_use(cq):
     return m
 
 
+_WORDS = None
+_WORD_RE = re.compile(r"\w+")
+_ASCII_WORD_RE = re.compile(r"[A-Za-z0-9_]+")
+
+
+def _words():
+    """word -> mask indexes built at image build (prep_index.py); False when absent"""
+    global _WORDS
+    if _WORDS is None:
+        p = os.path.join(HERE, "words.pkl")
+        try:
+            _WORDS = pickle.loads(open(p, "rb").read()) if os.path.exists(p) else False
+        except Exception:
+            _WORDS = False
+    return _WORDS
+
+
 def source_lines_mentioning(names):
     out = 0
     if not names: return 0
+    W = _words()
+    if W and all(_WORD_RE.fullmatch(n) for n in names):
+        ic = W["ident_cov"]
+        for n in names: out |= ic.get(n, 0)
+        return out
     pat = re.compile(r"\b(" + "|".join(map(re.escape, names)) + r")\b")
     for f, d in LINEMAP.items():
         src = COVSRC.get(f, {})
@@ -252,6 +274,15 @@ def tests_mentioning(tokens):
     out = 0
     toks = [t for t in tokens if len(t) >= 3]
     if not toks: return 0
+    W = _words()
+    if W:
+        tw = W["test_words"]
+        rest = []
+        for t in toks:
+            if _ASCII_WORD_RE.fullmatch(t): out |= tw.get(t.lower(), 0)
+            else: rest.append(t)
+        toks = rest
+        if not toks: return out
     pat = re.compile(r"(?i)(?<![A-Za-z0-9_])(" + "|".join(map(re.escape, toks)) + r")(?![A-Za-z0-9_])")
     for i, s in TSRC.items():
         if pat.search(s): out |= 1 << i
@@ -302,6 +333,47 @@ def _broken_import(st):
         if not re.search(r"^(?:(?:async\s+)?def|class)\s+%s\b|^%s\s*[:=]|^\s*(?:from\s+\S+\s+)?import\b[^\n]*\b%s\b|^\s+%s,?\s*$|\b%s\b\s*=" % ((re.escape(n),) * 5), src, re.M):
             return True
     return False
+
+
+def _public_names(mod):
+    src = _src(mod.replace(".", "/") + ".py") or _src(mod.replace(".", "/") + "/__init__.py") or ""
+    m = re.search(r"^__all__\s*=\s*[\[(]([^\])]*)", src, re.M)
+    if m:
+        return re.findall(r"[\"']([A-Za-z_]\w*)[\"']", m.group(1))
+    return sorted({x for x in re.findall(r"^(?:class|def)\s+([A-Za-z]\w*)|^([A-Za-z]\w*)\s*[:=]", src, re.M) for x in x if x})
+
+
+def _reexport_broken(f, names):
+    """True when another module (or test) imports one of `names` from module f, or reads it as an
+    attribute of f (`exp.DateAdd` after `from sqlglot import expressions as exp`)"""
+    if not names or not f.endswith(".py"):
+        return False
+    mod = f[:-3].replace("/", ".")
+    if mod.endswith(".__init__"):
+        mod = mod[:-9]
+    parent, _, last = mod.rpartition(".")
+    alt = "|".join(map(re.escape, sorted(set(names))))
+    from_mod = re.compile(r"^\s*from\s+%s\s+import\s+(\([^)]*\)|[^\n]*)" % re.escape(mod), re.M)
+    name_re = re.compile(r"\b(%s)\b" % alt)
+    aliases = set()
+    for g, src in _load_src()["src"].items():
+        if g == f:
+            continue
+        for m in from_mod.finditer(src):
+            if name_re.search(m.group(1)):
+                return True
+        if parent:
+            for m in re.finditer(r"^\s*from\s+%s\s+import\s+(\([^)]*\)|[^\n]*)" % re.escape(parent), src, re.M):
+                for part in m.group(1).strip("()").split(","):
+                    bits = part.split("#")[0].split(" as ")
+                    if bits[0].strip() == last:
+                        aliases.add(bits[-1].strip())
+        for m in re.finditer(r"^\s*import\s+%s(?:\s+as\s+(\w+))?" % re.escape(mod), src, re.M):
+            aliases.add(m.group(1) or mod)
+    if not aliases:
+        return False
+    use = re.compile(r"\b(%s)\.(%s)\b" % ("|".join(map(re.escape, sorted(aliases))), alt))
+    return any(use.search(src) for g, src in _load_src()["src"].items() if g != f)
 
 
 def select_mask(patch_text):
@@ -437,9 +509,14 @@ def select_mask(patch_text):
                 # a removed or edited import: code in this file still using a dropped name raises NameError
                 names = [x[2] for x in imp_hits if x[0] <= ln <= x[1]] or [x[2] for x in imp_hits]
                 added = "\n".join(info["plus"])
-                gone = [n for n in names if not re.search(r"\b%s\b" % re.escape(n), added)]
+                gone = [n for n in names if n != "*" and not re.search(r"\b%s\b" % re.escape(n), added)]
+                star = re.match(r"\s*from\s+([\w.]+)\s+import\s+\*", txt)
+                if star and not re.search(r"^\s*from\s+%s\s+import\s+\*" % re.escape(star.group(1)), added, re.M):
+                    gone += _public_names(star.group(1))
                 if gone:
                     sel |= lines_in_file_mentioning(f, gone)
+                    if _reexport_broken(f, gone):
+                        sel |= _everything()  # other modules take these names from this one
                 continue
             its = items_at(f, ln if not is_ins else max(ln - 1, 1))
             if is_ins:

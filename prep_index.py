@@ -16,3 +16,17 @@ for (c, a, k), m in I["keys"].items():
 I["_method_cov"] = mc; I["_keys_by_attr"] = kba
 open(os.path.join(HERE, "index.pkl"), "wb").write(pickle.dumps(I, protocol=5))
 open(os.path.join(HERE, "src.pkl"), "wb").write(gzip.decompress(open(os.path.join(HERE, "src.pkl.gz"), "rb").read()))
+
+# word indexes for the text searches (loaded only when a patch needs them)
+import re
+ident_cov = {}
+for f, d in I["linemap"].items():
+    src = I["covsrc"].get(f, {})
+    for ln, m in d.items():
+        for w in set(re.findall(r"\w+", src.get(ln, ""))):
+            ident_cov[w] = ident_cov.get(w, 0) | m
+test_words = {}
+for i, s in I["test_src"].items():
+    for w in set(t.lower() for t in re.findall(r"[A-Za-z0-9_]+", s)):
+        test_words[w] = test_words.get(w, 0) | (1 << i)
+open(os.path.join(HERE, "words.pkl"), "wb").write(pickle.dumps({"ident_cov": ident_cov, "test_words": test_words}, protocol=5))
