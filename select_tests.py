@@ -1289,6 +1289,8 @@ def _module_broken_mask(f):
 # ---- test_execute_tpcds (21 s): drop it when the patch can only change what optimize() returns, and
 # optimize() returns the same trees for every TPC-DS query the test executes ----
 TPCDS_EXEC = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+_DUCK_PREFIXES = ("sqlglot.generators.duckdb.", "sqlglot.dialects.duckdb.", "sqlglot.parsers.duckdb.",
+                  "sqlglot.tokenizers.duckdb.")
 _GATE = None
 _GATE_SPENT = [0.0]
 GATE_BUDGET = 45.0  # seconds of gate checks per batch at most (the batch has 3 minutes)
@@ -1331,6 +1333,25 @@ def tpcds_gate_drops(files):
         if not all(any(a < x <= b for a, b, _ in spans) for x in set(info["old"]) | set(info["ins"])):
             return False
         st = G.get("stages", {}).get(f, {})
+        # the stage trace starts after imports: a line that runs at import (package import, the executor
+        # tests' collection, class construction) is invisible to it, so it blocks the gate
+        C = _collect(); CB = _classbuild()
+        if not C or not CB:
+            return False
+        imp = set(C["core"].get(f, ()))
+        if "tests/test_executor.py" in C["tfiles"]:
+            ti = C["tfiles"].index("tests/test_executor.py")
+            imp |= {l for l, g in C["lines"].get(f, {}).items() if ti in C["groups"][g]}
+        cbl = CB["lines"].get(f, {})
+        for x in set(info["old"]) | set(info["ins"]) | {k - 1 for k in info["ins"]}:
+            if x in imp:
+                return False
+            if x in cbl:
+                built = CB["groups"][cbl[x]]
+                # building DuckDB classes only feeds the duckdb side, which the child re-imports patched
+                if not all(k.startswith(_DUCK_PREFIXES) for k in built):
+                    return False
+                need_stages.add("d")
         for x in set(info["old"]) | set(info["ins"]) | {k - 1 for k in info["ins"]}:
             code = st.get(str(x), "")
             if "x" in code:
