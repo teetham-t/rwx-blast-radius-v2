@@ -376,8 +376,9 @@ def _reexport_broken(f, names):
     return any(use.search(src) for g, src in _load_src()["src"].items() if g != f)
 
 
-def select_mask(patch_text):
-    files = parse_patch(patch_text)
+def select_mask(patch_text, files=None):
+    if files is None:
+        files = parse_patch(patch_text)
     sel = 0
     for f, info in files.items():
         if f.startswith("tests/") and f.endswith(".py") and not f.startswith("tests/fixtures/"):
@@ -717,9 +718,19 @@ def _class_family(names):
     return fam
 
 
+_POS = None
+
+
+def _pos():
+    global _POS
+    if _POS is None:
+        _POS = {t: i for i, t in enumerate(TESTS)}
+    return _POS
+
+
 def _ids_where(pred):
     m = 0
-    pos = {t: i for i, t in enumerate(TESTS)}
+    pos = _pos()
     for t in _all_ids():
         if pred(t):
             if t in pos: m |= 1 << pos[t]
@@ -917,7 +928,17 @@ def _segment(f, lines, info, lo, hi, limit=600):
     return None
 
 
+_VERDICTS = {}
+
+
 def file_verdict(f, info):
+    key = (f, id(info))
+    if key not in _VERDICTS:
+        _VERDICTS[key] = _file_verdict(f, info)
+    return _VERDICTS[key]
+
+
+def _file_verdict(f, info):
     """"all": the patched file no longer parses, so importing it fails; "none": same program
     (comments, formatting, docstrings, unevaluated annotations); None: look at the lines.
     Each cluster of changes is compared inside its smallest enclosing def / statement; the whole
@@ -980,30 +1001,26 @@ def _unimportable_mask(f):
     return m
 
 
+_UNNUMBERED = None
+
+
+def _unnumbered():
+    """test ids in tests.json the index does not number"""
+    global _UNNUMBERED
+    if _UNNUMBERED is None:
+        have = set(TESTS)
+        _UNNUMBERED = {t for t in _all_ids() if t not in have}
+    return set(_UNNUMBERED)
+
+
 def _everything():
-    EXTRA_IDS.update(t for t in _all_ids() if t not in set(TESTS))
+    EXTRA_IDS.update(_unnumbered())
     return (1 << len(TESTS)) - 1
 
 
 # ---- import-time failures: lines that run while `import sqlglot` or a test module's collection runs ----
 _COLLECT = None
 SG_ROOT = os.environ.get("BR_SG_ROOT", os.path.join(HERE, "sg"))  # pinned sqlglot, precompiled at image build
-_CHILD = r"""
-import sys, os, json, importlib, importlib.util, importlib.abc
-root, patched, mods = json.loads(sys.argv[1])
-sys.path.insert(0, root)
-class F(importlib.abc.MetaPathFinder):
-    def find_spec(self, name, path, target=None):
-        p = patched.get(name)
-        if p is None:
-            return None
-        if p.endswith("__init__.py"):
-            return importlib.util.spec_from_file_location(name, p, submodule_search_locations=[os.path.join(root, *name.split("."))])
-        return importlib.util.spec_from_file_location(name, p)
-sys.meta_path.insert(0, F())
-for m in mods:
-    importlib.import_module(m)
-"""
 
 
 def _collect():
@@ -1019,7 +1036,7 @@ def _collect():
 
 def _ids_where_pure(pred):
     m = 0; extra = set()
-    pos = {t: i for i, t in enumerate(TESTS)}
+    pos = _pos()
     for t in _all_ids():
         if pred(t):
             if t in pos: m |= 1 << pos[t]
@@ -1032,30 +1049,125 @@ def _mod_name(f):
     return m[:-9] if m.endswith(".__init__") else m
 
 
+_HELPER = None  # (pid, job write fd, result read fd) of a forked process holding a clean `import sqlglot`
+
+
+def _install_finder(table):
+    import importlib.abc, importlib.util
+
+    class _F(importlib.abc.MetaPathFinder):
+        def find_spec(self, name, path, target=None):
+            p = table.get(name)
+            if p is None:
+                return None
+            if p.endswith("__init__.py"):
+                return importlib.util.spec_from_file_location(
+                    name, p, submodule_search_locations=[os.path.join(SG_ROOT, *name.split("."))])
+            return importlib.util.spec_from_file_location(name, p)
+
+    sys.meta_path.insert(0, _F())
+
+
+def _child_import(table, mods):
+    """in a forked child: import mods with the patched files swapped in; exits 0 / 1, never returns"""
+    try:
+        import signal
+        signal.alarm(30)
+        dn = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(dn, 1); os.dup2(dn, 2)
+        import importlib
+        table.update(_child_import.pending)
+        for m in mods:
+            importlib.import_module(m)
+        os._exit(0)
+    except BaseException:
+        os._exit(1)
+
+
+_child_import.pending = {}
+
+
+def _wait_fail(pid):
+    _, st = os.waitpid(pid, 0)
+    return not (os.WIFEXITED(st) and os.WEXITSTATUS(st) == 0)
+
+
+def _helper():
+    """fork a helper that imports the pinned sqlglot once and forks a fresh copy per job"""
+    global _HELPER
+    if _HELPER is None:
+        import gc
+        gc.collect(); gc.freeze()
+        jr, jw = os.pipe(); rr, rw = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            try:
+                os.close(jw); os.close(rr)
+                dn = os.open(os.devnull, os.O_WRONLY); os.dup2(dn, 1); os.dup2(dn, 2)
+                table = {}
+                sys.path.insert(0, SG_ROOT); _install_finder(table)
+                import sqlglot  # noqa: F401
+                import gc as _gc, json as _j
+                _gc.collect(); _gc.freeze()
+                fin = os.fdopen(jr, "r")
+                for line in fin:
+                    job = _j.loads(line)
+                    c = os.fork()
+                    if c == 0:
+                        _child_import.pending = job["patched"]
+                        _child_import(table, job["mods"])
+                    os.write(rw, b"1" if _wait_fail(c) else b"0")
+            finally:
+                os._exit(0)
+        os.close(jr); os.close(rw)
+        _HELPER = (pid, jw, rr)
+    return _HELPER
+
+
+def shutdown_helper():
+    global _HELPER
+    if _HELPER is not None:
+        pid, jw, rr = _HELPER
+        _HELPER = None
+        try:
+            os.close(jw); os.waitpid(pid, 0)
+        except Exception:
+            pass
+
+
 def _imports_fail(patched, mods):
-    """import `mods` with the patched files swapped in; True when that raises (or hangs)"""
-    import subprocess, tempfile, json as j
+    """import `mods` with the patched files swapped in, in a forked child; True when that raises (or hangs).
+    Patches to modules `import sqlglot` never loads reuse a helper that already imported it."""
+    import tempfile, shutil, json as j
     if not os.path.isdir(SG_ROOT):
         return True  # cannot check: assume the worst
     tmp = tempfile.mkdtemp(prefix="br")
     pm = {}
-    for f, text in patched.items():
-        dst = os.path.join(tmp, f)
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        with open(dst, "w", encoding="utf-8") as fh:
-            fh.write(text)
-        pm[_mod_name(f)] = dst
     try:
-        r = subprocess.run([sys.executable, "-S", "-c", _CHILD, j.dumps([SG_ROOT, pm, mods])],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
-                           env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
-        return r.returncode != 0
-    except subprocess.TimeoutExpired:
-        return True
+        for f, text in patched.items():
+            dst = os.path.join(tmp, f)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            with open(dst, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            pm[_mod_name(f)] = dst
+        C = _collect()
+        core = C and any(f in C["core"] for f in patched)
+        if not core and C:
+            pid, jw, rr = _helper()
+            os.write(jw, (j.dumps({"patched": pm, "mods": mods}) + "\n").encode())
+            return os.read(rr, 1) != b"0"
+        import gc
+        gc.collect(); gc.freeze()
+        c = os.fork()
+        if c == 0:
+            table = {}
+            sys.path.insert(0, SG_ROOT); _install_finder(table)
+            _child_import.pending = pm
+            _child_import(table, mods)
+        return _wait_fail(c)
     except Exception:
         return True
     finally:
-        import shutil
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -1105,7 +1217,7 @@ def import_time_mask(files, sel):
         return 0
     tfs = {C["tfiles"][i] for i in tf_idx}
     if core_hit:
-        mask, extra = (1 << len(TESTS)) - 1, {t for t in _all_ids() if t not in set(TESTS)}
+        mask, extra = (1 << len(TESTS)) - 1, _unnumbered()
     else:
         mask, extra = _ids_where_pure(lambda t: t.split("::")[0] in tfs)
         for f in patched:
@@ -1188,10 +1300,11 @@ def extra_tests(patch_text):
 
 
 def select(patch_text):
-    EXTRA_IDS.clear()
-    sel = select_mask(patch_text)
+    EXTRA_IDS.clear(); _VERDICTS.clear()
+    files = parse_patch(patch_text)
+    sel = select_mask(patch_text, files)
     try:
-        sel |= import_time_mask(parse_patch(patch_text), sel)
+        sel |= import_time_mask(files, sel)
     except Exception:
         pass
     res = [TESTS[i] for i in range(len(TESTS)) if sel >> i & 1]

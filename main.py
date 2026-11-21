@@ -41,6 +41,10 @@ def main():
             have = {n for w in workers for n in w}
             workers[-1].extend(n for n in zero_ms if n not in have)
         out.append(json.dumps({"commit": cid, "workers": workers}))
+    try:
+        S.shutdown_helper()
+    except Exception:
+        pass
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
     print(f"cpu {time.process_time() - t0:.2f}s", file=sys.stderr)
 
