@@ -900,6 +900,16 @@ def _future_ann(tree):
                for n in tree.body)
 
 
+def _touched(f, info):
+    """old line numbers a patch touches (removed lines, both neighbours of an insertion); a touched signature
+    line (parameters, defaults, decorators) stands for its whole function, which defaults reach at every call"""
+    pts = set(info["old"]) | set(info["ins"]) | {k - 1 for k in info["ins"]}
+    for a, b, end in _load_src().get("sigs", {}).get(f, ()):
+        if any(a <= x <= b for x in pts):
+            pts |= set(range(a, end + 1))
+    return pts
+
+
 def _clusters(info, gap=3):
     pts = sorted(set(info["old"]) | set(info["ins"]))
     out = []
@@ -1215,7 +1225,7 @@ def import_time_mask(files, sel):
         if new is None:
             continue
         patched[f] = new
-        pts = set(info["old"]) | set(info["ins"]) | {k - 1 for k in info["ins"]}
+        pts = _touched(f, info)
         spans = SPANS.get(f, ())
         # a decorator added, or a def line edited: what matters is where the function body runs
         heads = [ln for ln, ts in info["ins"].items() if any(t.strip().startswith("@") for t in ts)]
@@ -1343,7 +1353,7 @@ def tpcds_gate_drops(files):
             ti = C["tfiles"].index("tests/test_executor.py")
             imp |= {l for l, g in C["lines"].get(f, {}).items() if ti in C["groups"][g]}
         cbl = CB["lines"].get(f, {})
-        for x in set(info["old"]) | set(info["ins"]) | {k - 1 for k in info["ins"]}:
+        for x in _touched(f, info):
             if x in imp:
                 return False
             if x in cbl:
@@ -1352,7 +1362,7 @@ def tpcds_gate_drops(files):
                 if not all(k.startswith(_DUCK_PREFIXES) for k in built):
                     return False
                 need_stages.add("d")
-        for x in set(info["old"]) | set(info["ins"]) | {k - 1 for k in info["ins"]}:
+        for x in _touched(f, info):
             code = st.get(str(x), "")
             if "x" in code:
                 return False  # runs in setup, planning / execution or test code
@@ -1369,14 +1379,13 @@ def tpcds_gate_drops(files):
         m = 0
         for f, info in files.items():
             pf = per.get(f, {})
-            for x in set(info["old"]) | set(info["ins"]) | {k - 1 for k in info["ins"]}:
+            for x in _touched(f, info):
                 m |= pf.get(str(x), 0)
         only = {i for i in range(len(G["queries"])) if m >> i & 1}
         ins = G.get("inside", {}); stg = G.get("stages", {})
         for f, info in files.items():
             pf = per.get(f, {}); inf = set(ins.get(f, ())); sf = stg.get(f, {})
-            if any((x in inf or "o" in sf.get(str(x), "")) and str(x) not in pf
-                   for x in set(info["old"]) | set(info["ins"]) | {k - 1 for k in info["ins"]}):
+            if any((x in inf or "o" in sf.get(str(x), "")) and str(x) not in pf for x in _touched(f, info)):
                 only = None  # runs only warm (after another query filled a cache): check every query
                 break
         if only is not None and not only:
@@ -1424,7 +1433,7 @@ def classbuild_mask(files):
             v = None
         if v == "none":
             continue
-        for x in set(info["old"]) | set(info["ins"]) | {k - 1 for k in info["ins"]}:
+        for x in _touched(f, info):
             g = lines.get(x)
             if g is not None:
                 classes.update(CB["groups"][g])
