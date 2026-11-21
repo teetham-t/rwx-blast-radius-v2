@@ -25,7 +25,10 @@ Selects which sqlglot tests a patch can break, using maps built from the pinned 
 | class header (`class X(Base):`) | every test that uses the class or a subclass |
 | decorator added above an existing def | every test that ran that def |
 | new module-level def / class / import | lines using a name it shadows (and the module's classes when the name is also used at import time); `from sqlglot.x import y` of a missing name counts as the module failing to import |
-| pure rename | the old path counts as deleted |
+| pure rename / binary file | the old path counts as deleted / tests that read the file |
+| enum member | removed or renamed while referenced: everything; new value: tests mentioning it and users of the class it names |
+| entry of a module-level table (`DIALECTS`) | what uses that key; other module-level assignments follow the names computed from them |
+| line that runs at import (`import sqlglot`, a test module's collection, module / class level) | if the selection lacks the tests that would fail, the patched modules are imported in a subprocess against a precompiled pinned tree (`collect_map.pkl.gz`, `tools/trace_collect.py`); when that raises: those tests, or everything for the package import |
 
 Line comparison (`equivalent`) is whitespace-insensitive only between tokens: indentation and the text of string
 literals must match exactly.
