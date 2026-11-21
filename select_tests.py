@@ -261,6 +261,41 @@ def fallback(lines, scope_mask=None):
     return m
 
 
+def _imported_names(st):
+    m = re.match(r"from\s+\S+\s+import\s+\(?([^)#]*)", st)
+    if m:
+        return [x.split(" as ")[-1].strip() for x in m.group(1).split(",") if x.strip() and x.strip() != "*"]
+    m = re.match(r"import\s+([^#]*)", st)
+    if m:
+        return [x.split(" as ")[-1].strip().split(".")[0] for x in m.group(1).split(",") if x.strip()]
+    return []
+
+
+def _broken_import(st):
+    """`from sqlglot.x import y` where the pinned sqlglot has no module x or no top-level y in it"""
+    m = re.match(r"from\s+(sqlglot[\w.]*)\s+import\s+\(?([^)#]*)", st)
+    if not m:
+        return False
+    base = m.group(1).replace(".", "/")
+    src = _src(base + ".py")
+    if src is None:
+        src = _src(base + "/__init__.py")
+        if src is None:
+            return True
+        pkg = base
+    else:
+        pkg = None
+    for x in m.group(2).split(","):
+        n = x.split(" as ")[0].strip()
+        if not n or n == "*":
+            continue
+        if pkg and (_src(pkg + "/" + n + ".py") is not None or _src(pkg + "/" + n + "/__init__.py") is not None):
+            continue
+        if not re.search(r"^(?:(?:async\s+)?def|class)\s+%s\b|^%s\s*[:=]|^\s*(?:from\s+\S+\s+)?import\b[^\n]*\b%s\b|^\s+%s,?\s*$|\b%s\b\s*=" % ((re.escape(n),) * 5), src, re.M):
+            return True
+    return False
+
+
 def select_mask(patch_text):
     files = parse_patch(patch_text)
     sel = 0
@@ -349,6 +384,24 @@ def select_mask(patch_text):
                         # overriding an inherited method: tests that ran the inherited one via this class
                         base_m = METHOD_COV.get(name, 0)
                         sel |= base_m & class_use(cq)
+                elif not cls or not txt[:1].isspace():
+                    # module level: a new def / class / import can shadow a name the module already uses
+                    mc = re.match(r"(?:async\s+)?(?:def|class)\s+([A-Za-z_0-9]+)", stripped)
+                    names = [mc.group(1)] if mc else _imported_names(stripped)
+                    if names:
+                        sel |= lines_in_file_mentioning(f, names)
+                        src = _src(f) or ""
+                        if any(len(re.findall(r"\b%s\b" % re.escape(n), src)) > 1 for n in names):
+                            # also used where coverage cannot see it (class bodies run at import)
+                            mod = f[:-3].replace("/", ".")
+                            for c, m in CLS_USE.items():
+                                if c.startswith(mod + "."): sel |= m
+                    if not mc and _broken_import(stripped):
+                        # importing a name that does not exist: the module itself fails to import
+                        for m in lm.values(): sel |= m
+                        mod = f[:-3].replace("/", ".")
+                        for c, m in CLS_USE.items():
+                            if c.startswith(mod + "."): sel |= m
                 continue
             if not is_ins and re.match(r"\s*(async\s+)?def\s|\s*@", txt):
                 for a, b, _ in SPANS.get(f, ()):
