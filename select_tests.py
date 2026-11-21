@@ -373,6 +373,21 @@ def select_mask(patch_text):
             if not stripped or stripped.startswith("#") or is_doc(txt):
                 continue
             if is_ins and (ln, info["ins"][ln].index(txt)) in inert:
+                if stripped.startswith("@"):
+                    rest = info["ins"][ln][info["ins"][ln].index(txt) + 1:]
+                    if not any(re.match(r"\s*(async\s+)?(def|class)\s", t) for t in rest):
+                        # a decorator added to an existing def / class: everything that ran it
+                        nxt = sorted((a, b) for a, b, _ in SPANS.get(f, ()) if ln <= a <= ln + 3)
+                        if nxt:
+                            for l2 in range(nxt[0][0], nxt[0][1] + 1): sel |= lm.get(l2, 0)
+                        else:
+                            its2 = [x for x in items_at(f, ln) if x[2] == "class"]
+                            for x in STRUCT.get(f, ()):
+                                if x[2] == "class" and ln <= x[0] <= ln + 3:
+                                    sel |= class_use(x[3])
+                            if its2:
+                                sel |= class_use(its2[-1][3])
+                        continue
                 md = re.match(r"\s*def\s+([A-Za-z_0-9]+)", txt)
                 its0 = items_at(f, max(ln - 1, 1))
                 cls = [x for x in its0 if x[2] == "class" and x[0] <= ln - 1 and ln <= x[1] + 1]
