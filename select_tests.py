@@ -1114,6 +1114,7 @@ def _helper():
                 os.close(jw); os.close(rr)
                 dn = os.open(os.devnull, os.O_WRONLY); os.dup2(dn, 1); os.dup2(dn, 2)
                 table = {}
+                import unittest  # noqa: F401  sqlglot turns on extra validation (UNITTEST) under a test runner
                 sys.path.insert(0, SG_ROOT); _install_finder(table)
                 import sqlglot  # noqa: F401
                 import gc as _gc, json as _j
@@ -1174,6 +1175,7 @@ def _imports_fail(patched, mods):
         c = os.fork()
         if c == 0:
             table = {}
+            import unittest  # noqa: F401  (UNITTEST, as under the test runner)
             sys.path.insert(0, SG_ROOT); _install_finder(table)
             _child_import.pending = pm
             _child_import(table, mods)
@@ -1342,10 +1344,11 @@ def tpcds_gate_drops(files):
             for x in set(info["old"]) | set(info["ins"]) | {k - 1 for k in info["ins"]}:
                 m |= pf.get(str(x), 0)
         only = {i for i in range(len(G["queries"])) if m >> i & 1}
-        ins = G.get("inside", {})
+        ins = G.get("inside", {}); stg = G.get("stages", {})
         for f, info in files.items():
-            pf = per.get(f, {}); inf = set(ins.get(f, ()))
-            if any(x in inf and str(x) not in pf for x in set(info["old"]) | set(info["ins"]) | {k - 1 for k in info["ins"]}):
+            pf = per.get(f, {}); inf = set(ins.get(f, ())); sf = stg.get(f, {})
+            if any((x in inf or "o" in sf.get(str(x), "")) and str(x) not in pf
+                   for x in set(info["old"]) | set(info["ins"]) | {k - 1 for k in info["ins"]}):
                 only = None  # runs only warm (after another query filled a cache): check every query
                 break
         if only is not None and not only:

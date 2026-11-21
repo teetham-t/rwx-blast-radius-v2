@@ -6,6 +6,7 @@ repo, out = sys.argv[1:3]
 CHILD = r'''
 import sys, os, json
 repo = sys.argv[1]; mod = sys.argv[2]
+import unittest  # sqlglot's UNITTEST flag is on under pytest
 sys.path.insert(0, repo)
 pre = sys.argv[3] == "1"
 if pre:

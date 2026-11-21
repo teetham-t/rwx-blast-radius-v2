@@ -2,6 +2,7 @@
 build (baseline, `python -S tpcds_gate_child.py <sg_root> <gate.json.gz> <out.json>`) and by the selector
 (forked child, patched sources swapped in): same code both times."""
 import hashlib
+import pickle
 
 
 def canon(e, exp):
@@ -21,7 +22,8 @@ def hashes(queries, schema, stop_at=None, only=None):
     for i, sql in enumerate(queries):
         if only is not None and i not in only:
             out.append(None); continue
-        o = optimize(parse_one(sql), schema, leave_tables_isolated=True, dialect=None)
+        # the test hands each parsed query to a process pool, i.e. through pickle
+        o = optimize(pickle.loads(pickle.dumps(parse_one(sql))), schema, leave_tables_isolated=True, dialect=None)
         h = hashlib.sha1(repr(canon(o, exp)).encode()).hexdigest()[:16]
         out.append(h)
         if stop_at is not None and stop_at[i] != h:
@@ -70,6 +72,7 @@ def check(g, stages, only):
 if __name__ == "__main__":
     import gzip, json, sys
     root, gate, dst = sys.argv[1:4]
+    import unittest  # noqa: F401  sqlglot's UNITTEST flag is on under the test runner
     sys.path.insert(0, root)
     g = json.loads(gzip.decompress(open(gate, "rb").read()))
     json.dump({"opt": hashes(g["queries"], g["schema"])[0], "parse": parse_hashes(g["all_queries"])[0],

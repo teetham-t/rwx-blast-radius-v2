@@ -6,6 +6,7 @@ repo, gate, out = sys.argv[1:4]
 CHILD = r'''
 import sys, os, json, gzip
 repo, gate, i = sys.argv[1], sys.argv[2], int(sys.argv[3])
+import unittest  # sqlglot's UNITTEST flag is on under the test runner
 sys.path.insert(0, repo)
 g = json.loads(gzip.decompress(open(gate, "rb").read()))
 from sqlglot import parse_one
@@ -18,7 +19,8 @@ def on_line(code, line):
         hits.add((os.path.relpath(code.co_filename, repo), line)); return M.DISABLE
     return M.DISABLE
 M.register_callback(T, M.events.LINE, on_line)
-e = parse_one(g["queries"][i])
+import pickle
+e = pickle.loads(pickle.dumps(parse_one(g["queries"][i])))  # as the test's process pool does
 M.set_events(T, M.events.LINE)
 optimize(e, g["schema"], leave_tables_isolated=True, dialect=None)
 M.set_events(T, 0)

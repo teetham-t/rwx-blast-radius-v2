@@ -28,7 +28,10 @@ Selects which sqlglot tests a patch can break, using maps built from the pinned 
 | pure rename / binary file | the old path counts as deleted / tests that read the file |
 | enum member | removed or renamed while referenced: everything; new value: tests mentioning it and users of the class it names |
 | entry of a module-level table (`DIALECTS`) | what uses that key; other module-level assignments follow the names computed from them |
+| `test_execute_tpcds` (21 s) selected | dropped when every change sits in function bodies that the test runs only while parsing the fixture SQL, optimizing it, or transpiling it for duckdb (stage map: `tools/trace_tpcds_phases.py`), and a forked child shows each stage still produces identical output for every query (parsed / optimized trees incl. types, duckdb SQL), against a baseline the image build computes with the same code (`tpcds_gate_child.py`); only queries whose optimize() runs a changed line are optimized (`tools/trace_tpcds_queries.py`) |
 | line that runs at import (`import sqlglot`, a test module's collection, module / class level) | if the selection lacks the tests that would fail, the patched modules are imported in a subprocess against a precompiled pinned tree (`collect_map.pkl.gz`, `tools/trace_collect.py`); when that raises: those tests, or everything for the package import |
+
+All helper processes import `unittest` first: sqlglot turns on extra validation (`UNITTEST`) under a test runner.
 
 Line comparison (`equivalent`) is whitespace-insensitive only between tokens: indentation and the text of string
 literals must match exactly.
