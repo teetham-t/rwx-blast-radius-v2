@@ -13,12 +13,14 @@ def canon(e, exp):
     return repr(e)
 
 
-def hashes(queries, schema, stop_at=None):
-    """yield the hash of each optimized query; stop_at: list of expected hashes (stop at first mismatch)"""
+def hashes(queries, schema, stop_at=None, only=None):
+    """hash of each optimized query; stop_at: expected hashes (stop at first mismatch); only: query indices"""
     from sqlglot import exp, parse_one
     from sqlglot.optimizer import optimize
     out = []
     for i, sql in enumerate(queries):
+        if only is not None and i not in only:
+            out.append(None); continue
         o = optimize(parse_one(sql), schema, leave_tables_isolated=True, dialect=None)
         h = hashlib.sha1(repr(canon(o, exp)).encode()).hexdigest()[:16]
         out.append(h)

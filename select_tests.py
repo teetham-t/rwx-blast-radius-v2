@@ -1082,7 +1082,7 @@ def _child_import(table, mods):
             g = _gate()
             sys.path.insert(1, HERE)
             import tpcds_gate_child
-            _, ok = tpcds_gate_child.hashes(g["queries"], g["schema"], stop_at=g["base"])
+            _, ok = tpcds_gate_child.hashes(g["queries"], g["schema"], stop_at=g["base"], only=_child_import.only)
             os._exit(0 if ok else 1)
         for m in mods:
             importlib.import_module(m)
@@ -1092,6 +1092,7 @@ def _child_import(table, mods):
 
 
 _child_import.pending = {}
+_child_import.only = None
 
 
 def _wait_fail(pid):
@@ -1122,6 +1123,7 @@ def _helper():
                     c = os.fork()
                     if c == 0:
                         _child_import.pending = job["patched"]
+                        _child_import.only = set(job["only"]) if job.get("only") is not None else None
                         _child_import(table, job["mods"])
                     os.write(rw, b"1" if _wait_fail(c) else b"0")
             finally:
@@ -1161,7 +1163,9 @@ def _imports_fail(patched, mods):
         core = C and any(f in C["core"] for f in patched)
         if not core and C:
             pid, jw, rr = _helper()
-            os.write(jw, (j.dumps({"patched": pm, "mods": mods}) + "\n").encode())
+            only = _child_import.only
+            os.write(jw, (j.dumps({"patched": pm, "mods": mods,
+                                   "only": sorted(only) if only is not None else None}) + "\n").encode())
             return os.read(rr, 1) != b"0"
         import gc
         gc.collect(); gc.freeze()
@@ -1323,11 +1327,30 @@ def tpcds_gate_drops(files):
         patched[f] = new
     if not patched:
         return False
+    per = G.get("per_query")
+    only = None
+    if per:
+        m = 0
+        for f, info in files.items():
+            pf = per.get(f, {})
+            for x in set(info["old"]) | set(info["ins"]) | {k - 1 for k in info["ins"]}:
+                m |= pf.get(str(x), 0)
+        only = {i for i in range(len(G["queries"])) if m >> i & 1}
+        ins = G.get("inside", {})
+        for f, info in files.items():
+            pf = per.get(f, {}); inf = set(ins.get(f, ()))
+            if any(x in inf and str(x) not in pf for x in set(info["old"]) | set(info["ins"]) | {k - 1 for k in info["ins"]}):
+                only = None  # runs only warm (after another query filled a cache): check every query
+                break
+        if only is not None and not only:
+            return True  # no query's optimize() runs a changed line: the test cannot change
     import time
     t0 = time.time()
     try:
+        _child_import.only = only
         return not _imports_fail(patched, ["@tpcds"])
     finally:
+        _child_import.only = None
         _GATE_SPENT[0] += time.time() - t0
 
 
