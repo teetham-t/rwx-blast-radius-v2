@@ -499,6 +499,13 @@ def select_mask(patch_text, files=None):
                         for c, m in CLS_USE.items():
                             if c.startswith(mod + "."): sel |= m
                 continue
+            sig = [x for x in _load_src().get("sigs", {}).get(f, ())
+                   if (x[0] < ln <= x[1] + 1 if is_ins else x[0] <= ln <= x[1])]
+            if sig:
+                # a signature line (parameters, defaults, decorators): every test that ran the function
+                a0, _, b0 = min(sig, key=lambda x: x[2] - x[0])
+                for l2 in range(a0, b0 + 1): sel |= lm.get(l2, 0)
+                continue
             if not is_ins and re.match(r"\s*(async\s+)?def\s|\s*@", txt):
                 for a, b, _ in SPANS.get(f, ()):
                     if a <= ln <= b:
@@ -1365,6 +1372,49 @@ def tpcds_gate_drops(files):
         _GATE_SPENT[0] += time.time() - t0
 
 
+# ---- class construction: function bodies that run while classes are built at import (metaclass __new__,
+# __init_subclass__, helpers called from class bodies). Coverage credits them to whichever test imported
+# first, but what they compute lives on the classes: select the users of those classes ----
+_CLASSBUILD = None
+
+
+def _classbuild():
+    global _CLASSBUILD
+    if _CLASSBUILD is None:
+        try:
+            _CLASSBUILD = pickle.loads(gzip.decompress(open(os.path.join(HERE, "classbuild_map.pkl.gz"), "rb").read()))
+        except Exception:
+            _CLASSBUILD = False
+    return _CLASSBUILD
+
+
+def classbuild_mask(files):
+    CB = _classbuild()
+    if not CB:
+        return 0
+    classes = set()
+    for f, info in files.items():
+        lines = CB["lines"].get(f)
+        if not lines or info.get("deleted") or info.get("new_file"):
+            continue
+        try:
+            v = file_verdict(f, info)
+        except Exception:
+            v = None
+        if v == "none":
+            continue
+        for x in set(info["old"]) | set(info["ins"]) | {k - 1 for k in info["ins"]}:
+            g = lines.get(x)
+            if g is not None:
+                classes.update(CB["groups"][g])
+    m = 0
+    for k in classes:
+        m |= class_use(k)
+        if k in EXPR_CLASSES:
+            m |= expr_mask(k)
+    return m
+
+
 LAZY_LOAD = "tests/dialects/test_dialect.py::TestDialect::test_lazy_load"
 TYPING_META = "tests/test_typing.py::TestTyping::test_no_redundant_expression_metadata"
 SQLGLOTC = ["tests/test_sqlglotc.py::TestSQLGlotC::test_build_removes_obsolete_extensions",
@@ -1404,6 +1454,10 @@ def select(patch_text):
     EXTRA_IDS.clear(); _VERDICTS.clear()
     files = parse_patch(patch_text)
     sel = select_mask(patch_text, files)
+    try:
+        sel |= classbuild_mask(files)
+    except Exception:
+        pass
     widened = 0
     try:
         widened = import_time_mask(files, sel)

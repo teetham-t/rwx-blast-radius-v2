@@ -4,7 +4,7 @@ import ast, gzip, os, pickle, subprocess, sys
 repo, out = sys.argv[1:3]
 fs = [f for f in subprocess.check_output(["git", "ls-files", "sqlglot", "tests"], cwd=repo, text=True).split()
       if f.endswith(".py") and not f.startswith("tests/fixtures/")]
-src = {}; spans = {}
+src = {}; spans = {}; sigs = {}
 for f in fs:
     s = open(os.path.join(repo, f), encoding="utf-8").read(); src[f] = s
     tree = ast.parse(s); sp = set()
@@ -15,5 +15,8 @@ for f in fs:
         if isinstance(n, (ast.Module, ast.ClassDef)):
             for c in n.body: sp.add((first(c), c.end_lineno))
     spans[f] = sorted(sp, key=lambda x: (x[1] - x[0], x[0]))  # smallest first
-open(out, "wb").write(gzip.compress(pickle.dumps({"src": src, "spans": spans}, protocol=4), 9, mtime=0))
+    # signatures: decorators + def line(s) up to the line before the body (defaults run at def time)
+    sigs[f] = sorted((first(n), n.body[0].lineno - 1, n.end_lineno) for n in ast.walk(tree)
+                     if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.body[0].lineno > n.lineno)
+open(out, "wb").write(gzip.compress(pickle.dumps({"src": src, "spans": spans, "sigs": sigs}, protocol=4), 9, mtime=0))
 print(len(src), "files")
