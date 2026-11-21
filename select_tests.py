@@ -1082,7 +1082,7 @@ def _child_import(table, mods):
             g = _gate()
             sys.path.insert(1, HERE)
             import tpcds_gate_child
-            _, ok = tpcds_gate_child.hashes(g["queries"], g["schema"], stop_at=g["base"], only=_child_import.only)
+            ok = tpcds_gate_child.check(g, _child_import.stages, _child_import.only)
             os._exit(0 if ok else 1)
         for m in mods:
             importlib.import_module(m)
@@ -1093,6 +1093,7 @@ def _child_import(table, mods):
 
 _child_import.pending = {}
 _child_import.only = None
+_child_import.stages = "o"
 
 
 def _wait_fail(pid):
@@ -1124,6 +1125,7 @@ def _helper():
                     if c == 0:
                         _child_import.pending = job["patched"]
                         _child_import.only = set(job["only"]) if job.get("only") is not None else None
+                        _child_import.stages = job.get("stages", "o")
                         _child_import(table, job["mods"])
                     os.write(rw, b"1" if _wait_fail(c) else b"0")
             finally:
@@ -1164,7 +1166,7 @@ def _imports_fail(patched, mods):
         if not core and C:
             pid, jw, rr = _helper()
             only = _child_import.only
-            os.write(jw, (j.dumps({"patched": pm, "mods": mods,
+            os.write(jw, (j.dumps({"patched": pm, "mods": mods, "stages": _child_import.stages,
                                    "only": sorted(only) if only is not None else None}) + "\n").encode())
             return os.read(rr, 1) != b"0"
         import gc
@@ -1291,7 +1293,8 @@ def _gate():
             g = j.loads(gzip.decompress(open(os.path.join(HERE, "tpcds_gate.json.gz"), "rb").read()))
             g["outside"] = {f: set(v) for f, v in g["outside"].items()}
             g["base"] = j.load(open(os.path.join(HERE, "tpcds_base.json")))
-            if len(g["base"]) != len(g["queries"]):
+            if any(len(g["base"][k]) != len(g["queries"]) for k in ("opt", "duck")) or \
+                    len(g["base"]["parse"]) != len(g["all_queries"]):
                 raise ValueError
             _GATE = g
         except Exception:
@@ -1306,7 +1309,7 @@ def tpcds_gate_drops(files):
     G = _gate()
     if not G or _GATE_SPENT[0] > GATE_BUDGET:
         return False
-    patched = {}
+    patched = {}; need_stages = set()
     for f, info in files.items():
         if not (f.startswith("sqlglot/") and f.endswith(".py")) or info.get("deleted") or info.get("new_file"):
             return False
@@ -1318,9 +1321,12 @@ def tpcds_gate_drops(files):
         spans = SPANS.get(f, ())
         if not all(any(a < x <= b for a, b, _ in spans) for x in set(info["old"]) | set(info["ins"])):
             return False
-        out = G["outside"].get(f, ())
-        if any(x in out for x in set(info["old"]) | set(info["ins"]) | {k - 1 for k in info["ins"]}):
-            return False
+        st = G.get("stages", {}).get(f, {})
+        for x in set(info["old"]) | set(info["ins"]) | {k - 1 for k in info["ins"]}:
+            code = st.get(str(x), "")
+            if "x" in code:
+                return False  # runs in setup, planning / execution or test code
+            need_stages.update(code)
         new = rebuild(_src(f), info)
         if new is None:
             return False
@@ -1343,14 +1349,16 @@ def tpcds_gate_drops(files):
                 only = None  # runs only warm (after another query filled a cache): check every query
                 break
         if only is not None and not only:
-            return True  # no query's optimize() runs a changed line: the test cannot change
+            need_stages.discard("o")  # no query's optimize() runs a changed line
+    if not need_stages:
+        return True  # no stage of the test runs a changed line: it cannot change
     import time
     t0 = time.time()
     try:
-        _child_import.only = only
+        _child_import.only = only; _child_import.stages = "".join(sorted(need_stages))
         return not _imports_fail(patched, ["@tpcds"])
     finally:
-        _child_import.only = None
+        _child_import.only = None; _child_import.stages = "o"
         _GATE_SPENT[0] += time.time() - t0
 
 

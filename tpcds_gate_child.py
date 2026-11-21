@@ -29,10 +29,48 @@ def hashes(queries, schema, stop_at=None, only=None):
     return out, True
 
 
+def _h(x):
+    return hashlib.sha1(x.encode()).hexdigest()[:16]
+
+
+def parse_hashes(queries, stop_at=None):
+    """the test parses each fixture query with parse_one before executing it"""
+    from sqlglot import exp, parse_one
+    out = []
+    for i, sql in enumerate(queries):
+        out.append(_h(repr(canon(parse_one(sql), exp))))
+        if stop_at is not None and stop_at[i] != out[-1]:
+            return out, False
+    return out, True
+
+
+def duck_hashes(queries, stop_at=None):
+    """the expected side: transpile(sql, write="duckdb")[0], run by duckdb"""
+    from sqlglot import transpile
+    out = []
+    for i, sql in enumerate(queries):
+        out.append(_h(transpile(sql, write="duckdb")[0]))
+        if stop_at is not None and stop_at[i] != out[-1]:
+            return out, False
+    return out, True
+
+
+def check(g, stages, only):
+    """stages: subset of "pod"; only: optimize query indices (None = all). True when all identical"""
+    b = g["base"]
+    if "p" in stages and not parse_hashes(g["all_queries"], b["parse"])[1]:
+        return False
+    if "d" in stages and not duck_hashes(g["queries"], b["duck"])[1]:
+        return False
+    if "o" in stages and not hashes(g["queries"], g["schema"], stop_at=b["opt"], only=only)[1]:
+        return False
+    return True
+
+
 if __name__ == "__main__":
     import gzip, json, sys
     root, gate, dst = sys.argv[1:4]
     sys.path.insert(0, root)
     g = json.loads(gzip.decompress(open(gate, "rb").read()))
-    hs, _ = hashes(g["queries"], g["schema"])
-    json.dump(hs, open(dst, "w"))
+    json.dump({"opt": hashes(g["queries"], g["schema"])[0], "parse": parse_hashes(g["all_queries"])[0],
+               "duck": duck_hashes(g["queries"])[0]}, open(dst, "w"))
