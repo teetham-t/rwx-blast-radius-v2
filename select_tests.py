@@ -404,7 +404,7 @@ def select_mask(patch_text):
         except Exception:
             verdict = None
         if verdict == "all":
-            sel |= _everything(); continue
+            sel |= _unimportable_mask(f); continue
         if verdict == "none":
             continue
         # events: (old line, text, is_insert)
@@ -966,9 +966,190 @@ def file_verdict(f, info):
     return None
 
 
+def _unimportable_mask(f):
+    """f no longer imports: everything when `import sqlglot` loads it, else what uses f's module or a
+    module importing it, plus whole test files whose collection imports one of them"""
+    C = _collect()
+    if not C or f in C["core"] or any(g in C["core"] for g in _module_importers(f)):
+        return _everything()
+    mods = _module_importers(f)
+    tfs = {tf for tf, fs in C["mods"].items() if any(g in mods for g in fs)}
+    m = _module_broken_mask(f)
+    if tfs:
+        m |= _ids_where(lambda t: t.split("::")[0] in tfs)
+    return m
+
+
 def _everything():
     EXTRA_IDS.update(t for t in _all_ids() if t not in set(TESTS))
     return (1 << len(TESTS)) - 1
+
+
+# ---- import-time failures: lines that run while `import sqlglot` or a test module's collection runs ----
+_COLLECT = None
+SG_ROOT = os.environ.get("BR_SG_ROOT", os.path.join(HERE, "sg"))  # pinned sqlglot, precompiled at image build
+_CHILD = r"""
+import sys, os, json, importlib, importlib.util, importlib.abc
+root, patched, mods = json.loads(sys.argv[1])
+sys.path.insert(0, root)
+class F(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path, target=None):
+        p = patched.get(name)
+        if p is None:
+            return None
+        if p.endswith("__init__.py"):
+            return importlib.util.spec_from_file_location(name, p, submodule_search_locations=[os.path.join(root, *name.split("."))])
+        return importlib.util.spec_from_file_location(name, p)
+sys.meta_path.insert(0, F())
+for m in mods:
+    importlib.import_module(m)
+"""
+
+
+def _collect():
+    global _COLLECT
+    if _COLLECT is None:
+        try:
+            _COLLECT = pickle.loads(gzip.decompress(open(os.path.join(HERE, "collect_map.pkl.gz"), "rb").read()))
+            _COLLECT["core"] = {f: set(v) for f, v in _COLLECT["core"].items()}
+        except Exception:
+            _COLLECT = False
+    return _COLLECT
+
+
+def _ids_where_pure(pred):
+    m = 0; extra = set()
+    pos = {t: i for i, t in enumerate(TESTS)}
+    for t in _all_ids():
+        if pred(t):
+            if t in pos: m |= 1 << pos[t]
+            else: extra.add(t)
+    return m, extra
+
+
+def _mod_name(f):
+    m = f[:-3].replace("/", ".")
+    return m[:-9] if m.endswith(".__init__") else m
+
+
+def _imports_fail(patched, mods):
+    """import `mods` with the patched files swapped in; True when that raises (or hangs)"""
+    import subprocess, tempfile, json as j
+    if not os.path.isdir(SG_ROOT):
+        return True  # cannot check: assume the worst
+    tmp = tempfile.mkdtemp(prefix="br")
+    pm = {}
+    for f, text in patched.items():
+        dst = os.path.join(tmp, f)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        with open(dst, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        pm[_mod_name(f)] = dst
+    try:
+        r = subprocess.run([sys.executable, "-S", "-c", _CHILD, j.dumps([SG_ROOT, pm, mods])],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
+                           env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+        return r.returncode != 0
+    except subprocess.TimeoutExpired:
+        return True
+    except Exception:
+        return True
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def import_time_mask(files, sel):
+    """A change on a line that runs at import (package import or test-module collection) can make the
+    import raise, and then every test in the affected modules fails. When the selection does not already
+    hold those tests, actually import the patched modules (cheap: everything else is precompiled)."""
+    C = _collect()
+    if not C:
+        return 0
+    core_hit = False; tf_idx = set(); patched = {}; module_hit = set()
+    for f, info in files.items():
+        if not (f.startswith("sqlglot/") and f.endswith(".py")) or info.get("deleted") or info.get("new_file"):
+            continue
+        try:
+            v = file_verdict(f, info)
+        except Exception:
+            v = None
+        if v in ("none", "all"):
+            continue
+        old = _src(f)
+        new = rebuild(old, info) if old is not None else None
+        if new is None:
+            continue
+        patched[f] = new
+        pts = set(info["old"]) | set(info["ins"]) | {k - 1 for k in info["ins"]}
+        spans = SPANS.get(f, ())
+        # a decorator added, or a def line edited: what matters is where the function body runs
+        heads = [ln for ln, ts in info["ins"].items() if any(t.strip().startswith("@") for t in ts)]
+        heads += [ln for ln, t in info["minus"].items() if re.match(r"\s*(async\s+def|def|@)", t)]
+        for h in heads:
+            for a, b, _ in spans:
+                if h <= a <= h + 3:
+                    pts |= set(range(a, b + 1))
+        # a line outside every function runs whenever the module is imported
+        if any(not any(a < x <= b for a, b, _ in spans) for x in set(info["old"]) | set(info["ins"])):
+            module_hit.add(f)
+        core = C["core"].get(f, ())
+        if any(x in core for x in pts):
+            core_hit = True
+        lines = C["lines"].get(f, {})
+        for x in pts:
+            g = lines.get(x)
+            if g is not None:
+                tf_idx.update(C["groups"][g])
+    if not (core_hit or tf_idx or module_hit) or not patched:
+        return 0
+    tfs = {C["tfiles"][i] for i in tf_idx}
+    if core_hit:
+        mask, extra = (1 << len(TESTS)) - 1, {t for t in _all_ids() if t not in set(TESTS)}
+    else:
+        mask, extra = _ids_where_pure(lambda t: t.split("::")[0] in tfs)
+        for f in patched:
+            mask |= _module_broken_mask(f)
+    if not (mask & ~sel) and extra <= EXTRA_IDS:
+        return 0  # nothing to add
+    mods = ["sqlglot"] if core_hit else []
+    for tf in sorted(tfs):
+        mods += [_mod_name(x) for x in C["mods"].get(tf, ()) if _mod_name(x) not in mods]
+    mods += [_mod_name(f) for f in sorted(module_hit) if _mod_name(f) not in mods]
+    if _imports_fail(patched, mods):
+        EXTRA_IDS.update(extra)
+        return mask
+    return 0
+
+
+_IMPORTERS = {}
+
+
+def _module_importers(f):
+    """sqlglot modules importing f's module, transitively (f included): graph built at image build"""
+    if f in _IMPORTERS:
+        return _IMPORTERS[f]
+    graph = _load_src().get("importers")
+    if graph is None:
+        return {f}
+    seen = {f}; stack = [f]
+    while stack:
+        for h in graph.get(stack.pop(), ()):
+            if h not in seen:
+                seen.add(h); stack.append(h)
+    _IMPORTERS[f] = seen
+    return seen
+
+
+def _module_broken_mask(f):
+    """everything that runs code from f's module or a module importing it, or uses their classes"""
+    m = 0
+    for g in _module_importers(f):
+        for x in LINEMAP.get(g, {}).values(): m |= x
+        mod = _mod_name(g)
+        for c, cm in CLS_USE.items():
+            if c.startswith(mod + ".") and "." not in c[len(mod) + 1:]: m |= cm
+    return m
 
 
 LAZY_LOAD = "tests/dialects/test_dialect.py::TestDialect::test_lazy_load"
@@ -1009,6 +1190,10 @@ def extra_tests(patch_text):
 def select(patch_text):
     EXTRA_IDS.clear()
     sel = select_mask(patch_text)
+    try:
+        sel |= import_time_mask(parse_patch(patch_text), sel)
+    except Exception:
+        pass
     res = [TESTS[i] for i in range(len(TESTS)) if sel >> i & 1]
     res += [t for t in sorted(EXTRA_IDS) if t not in set(res)]
     try:
