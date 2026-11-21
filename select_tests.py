@@ -376,6 +376,67 @@ def _reexport_broken(f, names):
     return any(use.search(src) for g, src in _load_src()["src"].items() if g != f)
 
 
+# ---- sqlglot/typing/: entries of the expression metadata tables are keyed by expression class ----
+_TYPING_ITEMS = {}
+_EXPR_BY_NAME = None
+
+
+def _expr_by_name():
+    global _EXPR_BY_NAME
+    if _EXPR_BY_NAME is None:
+        _EXPR_BY_NAME = {}
+        for q in EXPR_CLASSES:
+            _EXPR_BY_NAME.setdefault(q.rsplit(".", 1)[-1], q)
+    return _EXPR_BY_NAME
+
+
+def _typing_items(f):
+    """(first line, last line, ast node) of every item of the module-level dict literals in f"""
+    if f not in _TYPING_ITEMS:
+        items = []
+        try:
+            tree = _ast.parse(_src(f) or "")
+            for n in tree.body:
+                v = n.value if isinstance(n, (_ast.Assign, _ast.AnnAssign)) else None
+                if isinstance(v, _ast.Dict):
+                    for k, val in zip(v.keys, v.values):
+                        nodes = [x for x in (k, val) if x is not None]
+                        items.append((min(x.lineno for x in nodes), max(x.end_lineno for x in nodes), nodes))
+        except Exception:
+            items = []
+        _TYPING_ITEMS[f] = items
+    return _TYPING_ITEMS[f]
+
+
+def typing_entry_mask(f, info):
+    """tests creating nodes of the expression classes an edited metadata entry names (None: not entry-local)"""
+    items = _typing_items(f)
+    if not items:
+        return None
+    names = set()
+    for x in set(info["old"]) | {k for k in info["ins"]} | {k - 1 for k in info["ins"] if info["ins"][k]}:
+        hit = [it for it in items if it[0] <= x <= it[1]]
+        if not hit:
+            if x in info["ins"] or x in info["old"]:
+                return None  # outside every entry: let the line logic decide
+            continue
+        for node in hit[0][2]:
+            for a in _ast.walk(node):
+                if isinstance(a, _ast.Attribute) and isinstance(a.value, _ast.Name) and a.value.id == "exp":
+                    names.add(a.attr)
+    for ts in info["ins"].values():
+        for t in ts:
+            names.update(re.findall(r"\bexp\.([A-Za-z_]\w*)", t))
+    by = _expr_by_name()
+    quals = [by[n] for n in names if n in by]
+    if not quals:
+        return None
+    m = 0
+    for q in quals:
+        m |= expr_mask(q)
+    return m
+
+
 def select_mask(patch_text, files=None):
     if files is None:
         files = parse_patch(patch_text)
@@ -408,6 +469,14 @@ def select_mask(patch_text, files=None):
             sel |= _unimportable_mask(f); continue
         if verdict == "none":
             continue
+        if f.startswith("sqlglot/typing/"):
+            try:
+                tm = typing_entry_mask(f, info)
+            except Exception:
+                tm = None
+            if tm is not None:
+                sel |= tm
+                continue
         # events: (old line, text, is_insert)
         equiv = {ln for ln, p in info["pair"].items() if equivalent(info["minus"][ln], p)}
         events = [(ln, txt, False) for ln, txt in info["minus"].items() if ln not in equiv]
@@ -1330,7 +1399,7 @@ def tpcds_gate_drops(files):
     G = _gate()
     if not G or _GATE_SPENT[0] > GATE_BUDGET:
         return False
-    patched = {}; need_stages = set()
+    patched = {}; need_stages = set(); all_queries = False
     for f, info in files.items():
         if not (f.startswith("sqlglot/") and f.endswith(".py")) or info.get("deleted") or info.get("new_file"):
             return False
@@ -1339,6 +1408,15 @@ def tpcds_gate_drops(files):
             continue
         if v == "all":
             return False
+        if f.startswith("sqlglot/typing/") and typing_entry_mask(f, info) is not None:
+            # a type-metadata entry: during this test only optimize() annotates types (dialect None, so only
+            # the base table matters), and entries are looked up by class, not run as lines: check every query
+            if f == "sqlglot/typing/__init__.py":
+                new = rebuild(_src(f), info)
+                if new is None:
+                    return False
+                patched[f] = new; need_stages.add("o"); all_queries = True
+            continue
         spans = SPANS.get(f, ())
         if not all(any(a < x <= b for a, b, _ in spans) for x in set(info["old"]) | set(info["ins"])):
             return False
@@ -1372,10 +1450,10 @@ def tpcds_gate_drops(files):
             return False
         patched[f] = new
     if not patched:
-        return False
+        return not need_stages  # only dialect type tables changed: nothing this test runs reads them
     per = G.get("per_query")
     only = None
-    if per:
+    if per and not all_queries:
         m = 0
         for f, info in files.items():
             pf = per.get(f, {})
@@ -1388,7 +1466,7 @@ def tpcds_gate_drops(files):
             if any((x in inf or "o" in sf.get(str(x), "")) and str(x) not in pf for x in _touched(f, info)):
                 only = None  # runs only warm (after another query filled a cache): check every query
                 break
-        if only is not None and not only:
+        if only is not None and not only and not all_queries:
             need_stages.discard("o")  # no query's optimize() runs a changed line
     if not need_stages:
         return True  # no stage of the test runs a changed line: it cannot change
