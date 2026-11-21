@@ -20,7 +20,6 @@ Selects which sqlglot tests a patch can break, using maps built from the pinned 
 | `x is None` <-> `x == None`, `is` <-> `==` against an enum member | nothing: the two can't behave differently |
 | one-line dict (`{"x": ..., "u": ...}`) | only the entry whose columns changed |
 | `sqlglot/typing/`, core imports, `sqlglotc/` | also the few tests that work in subprocesses or read source files |
-
 | any `sqlglot/` or `tests/` `.py` file | rebuilt from the bundled pinned sources (`src.pkl.gz`) and each changed region compared as an AST inside its smallest enclosing def / statement: a file that no longer parses selects every test; an identical AST (comments, formatting, parentheses, docstrings, annotations under `from __future__ import annotations`) selects nothing |
 | test module outside a test (`setUp`, helpers, `Validator`) | every test of that class and its subclasses; module level (`tests/helpers.py`...): the module and the importers that use the changed name |
 | class header (`class X(Base):`) | every test that uses the class or a subclass |
