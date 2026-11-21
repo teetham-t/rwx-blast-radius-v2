@@ -11,7 +11,10 @@ import os, pickle, re, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 import gzip
-IDX = pickle.loads(gzip.decompress(open(os.path.join(HERE, "index.pkl.gz"), "rb").read()))
+if os.path.exists(os.path.join(HERE, "index.pkl")):  # decompressed + precomputed at image build
+    IDX = pickle.loads(open(os.path.join(HERE, "index.pkl"), "rb").read())
+else:
+    IDX = pickle.loads(gzip.decompress(open(os.path.join(HERE, "index.pkl.gz"), "rb").read()))
 REPO = os.environ.get("SQLGLOT_REPO", os.path.join(HERE, "sqlglot"))
 TESTS = IDX["tests"]; DURS = IDX["durs"]
 LINEMAP = IDX["linemap"]; SPANS = IDX["spans"]
@@ -41,19 +44,23 @@ def lines_in_file_mentioning(f, names):
     return out
 
 import ast as _ast
-METHOD_COV = {}
-for _f, _sp in SPANS.items():
-    _lm = LINEMAP.get(_f, {})
-    for _a, _b, _n in _sp:
-        _m = 0
-        for _l in range(_a, _b + 1): _m |= _lm.get(_l, 0)
-        METHOD_COV[_n] = METHOD_COV.get(_n, 0) | _m
+METHOD_COV = IDX.get("_method_cov")
+if METHOD_COV is None:
+    METHOD_COV = {}
+    for _f, _sp in SPANS.items():
+        _lm = LINEMAP.get(_f, {})
+        for _a, _b, _n in _sp:
+            _m = 0
+            for _l in range(_a, _b + 1): _m |= _lm.get(_l, 0)
+            METHOD_COV[_n] = METHOD_COV.get(_n, 0) | _m
 MODULE_ASSIGNS = IDX.get("module_assigns", {})
 
 # index (class, attr) -> list of (key, mask) for quick per-attr lookups
-KEYS_BY_ATTR = {}
-for (c, a, k), m in KEYS.items():
-    KEYS_BY_ATTR.setdefault((c, a), []).append((k, m))
+KEYS_BY_ATTR = IDX.get("_keys_by_attr")
+if KEYS_BY_ATTR is None:
+    KEYS_BY_ATTR = {}
+    for (c, a, k), m in KEYS.items():
+        KEYS_BY_ATTR.setdefault((c, a), []).append((k, m))
 
 
 def _new_entry():
@@ -597,7 +604,10 @@ def _load_src():
     global _SRC
     if _SRC is None:
         try:
-            _SRC = pickle.loads(gzip.decompress(open(os.path.join(HERE, "src.pkl.gz"), "rb").read()))
+            if os.path.exists(os.path.join(HERE, "src.pkl")):
+                _SRC = pickle.loads(open(os.path.join(HERE, "src.pkl"), "rb").read())
+            else:
+                _SRC = pickle.loads(gzip.decompress(open(os.path.join(HERE, "src.pkl.gz"), "rb").read()))
         except Exception:
             _SRC = {"src": {}, "spans": {}}
     return _SRC
