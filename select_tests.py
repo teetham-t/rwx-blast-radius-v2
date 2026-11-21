@@ -1222,6 +1222,10 @@ def _helper():
     return _HELPER
 
 
+_CHECK_SPENT = [0.0]
+CHECK_BUDGET = 60.0  # seconds of import / gate checks per batch; past it a check counts as failed
+
+
 def shutdown_helper():
     global _HELPER
     if _HELPER is not None:
@@ -1236,9 +1240,10 @@ def shutdown_helper():
 def _imports_fail(patched, mods):
     """import `mods` with the patched files swapped in, in a forked child; True when that raises (or hangs).
     Patches to modules `import sqlglot` never loads reuse a helper that already imported it."""
-    import tempfile, shutil, json as j
-    if not os.path.isdir(SG_ROOT):
-        return True  # cannot check: assume the worst
+    import tempfile, shutil, json as j, time
+    if not os.path.isdir(SG_ROOT) or _CHECK_SPENT[0] > CHECK_BUDGET:
+        return True  # cannot check (or out of time for checks): assume the worst
+    _t0 = time.time()
     tmp = tempfile.mkdtemp(prefix="br")
     pm = {}
     try:
@@ -1270,6 +1275,7 @@ def _imports_fail(patched, mods):
         return True
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+        _CHECK_SPENT[0] += time.time() - _t0
 
 
 def import_time_mask(files, sel):
