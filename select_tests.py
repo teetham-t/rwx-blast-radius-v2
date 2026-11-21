@@ -56,12 +56,44 @@ for (c, a, k), m in KEYS.items():
     KEYS_BY_ATTR.setdefault((c, a), []).append((k, m))
 
 
+def _new_entry():
+    return {"old": set(), "ins": {}, "minus": {}, "plus": [], "pair": {}, "paired_ins": set()}
+
+
 def parse_patch(text):
+    """old line numbers removed ("minus"), lines inserted before old line n ("ins"), and which
+    removed line each inserted line replaces ("pair"). Hunk line counts are honoured, so a removed
+    line that starts with "-- " (SQL comment) is never taken for a file header."""
     files = {}; cur = None; o = 0; prev_path = None
-    hunk_old = None
+    rem_old = rem_new = 0; run_minus = []; plus_seen = 0
     for line in text.split("\n"):
+        if rem_old > 0 or rem_new > 0:
+            if cur is not None:
+                if line.startswith("-"):
+                    if not run_minus or plus_seen: run_minus = []; plus_seen = 0
+                    cur["old"].add(o); cur["minus"][o] = line[1:]; run_minus.append(o); o += 1; rem_old -= 1
+                    continue
+                if line.startswith("+"):
+                    cur["ins"].setdefault(o, []).append(line[1:]); cur["plus"].append(line[1:])
+                    if run_minus and plus_seen < len(run_minus):
+                        cur["pair"][run_minus[plus_seen]] = line[1:]
+                        cur["paired_ins"].add((o, len(cur["ins"][o]) - 1))
+                    plus_seen += 1; rem_new -= 1
+                    continue
+                if line.startswith("\\"):
+                    continue
+                if line.startswith(" ") or line == "":
+                    o += 1; rem_old -= 1; rem_new -= 1; run_minus = []; plus_seen = 0
+                    continue
+            rem_old = rem_new = 0  # malformed hunk: fall through to header parsing
         if line.startswith("diff --git"):
             cur = None; continue
+        if line.startswith("rename from ") or line.startswith("copy from "):
+            # the old path stops existing (rename): every test that used it may break
+            p = line.split(" ", 2)[2].strip()
+            if line.startswith("rename"):
+                files.setdefault(p, _new_entry())["deleted"] = True
+            continue
         if line.startswith("--- "):
             prev_path = line[4:].strip().split("\t")[0]
             prev_path = prev_path[2:] if prev_path.startswith("a/") else prev_path
@@ -72,27 +104,18 @@ def parse_patch(text):
             deleted = p == "/dev/null"
             if deleted:
                 p = prev_path  # file deleted: attribute its lines to the old path
-            cur = files.setdefault(p, {"old": set(), "ins": {}, "minus": {}, "plus": [], "pair": {}, "paired_ins": set()})
-            cur["deleted"] = deleted
+            cur = files.setdefault(p, _new_entry())
+            cur["deleted"] = deleted or cur.get("deleted", False)
+            cur["new_file"] = prev_path == "/dev/null"
             run_minus = []; plus_seen = 0
             continue
         m = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
-        if m:
-            o = int(m.group(1)); run_minus = []; plus_seen = 0; continue
-        if cur is None:
+        if m and cur is not None:
+            o = int(m.group(1)); run_minus = []; plus_seen = 0
+            rem_old = int(m.group(2)) if m.group(2) is not None else 1
+            rem_new = int(m.group(4)) if m.group(4) is not None else 1
+            if rem_old == 0: o += 1  # "@@ -n,0": insertion after old line n
             continue
-        if line.startswith("-"):
-            if not run_minus or plus_seen: run_minus = []; plus_seen = 0
-            cur["old"].add(o); cur["minus"][o] = line[1:]; run_minus.append(o); o += 1
-        elif line.startswith("+"):
-            # inserted before old line o
-            cur["ins"].setdefault(o, []).append(line[1:]); cur["plus"].append(line[1:])
-            if run_minus and plus_seen < len(run_minus):
-                cur["pair"][run_minus[plus_seen]] = line[1:]
-                cur["paired_ins"].add((o, len(cur["ins"][o]) - 1))
-            plus_seen += 1
-        elif line.startswith(" ") or line == "":
-            o += 1; run_minus = []; plus_seen = 0
     return files
 
 
@@ -135,12 +158,28 @@ def _norm_eq(s):
     return s
 
 
+_STRSEG = re.compile(r"(\"(?:[^\"\\\\]|\\\\.)*\"|'(?:[^'\\\\]|\\\\.)*')")
+
+
+def _canon(s):
+    """whitespace-insensitive outside string literals, exact inside them"""
+    parts = _STRSEG.split(s.strip())
+    return tuple(p if k % 2 else " ".join(p.split()) for k, p in enumerate(parts))
+
+
 def equivalent(a, b):
     """True when two versions of a line cannot behave differently (identity vs equality
-    against None or an enum member, or only whitespace)."""
-    if a == b or a.split() == b.split():
+    against None or an enum member, or whitespace between tokens). Indentation and the text
+    of string literals must match exactly."""
+    if a == b:
         return True
-    return _norm_eq(a).split() == _norm_eq(b).split()
+    if len(a) - len(a.lstrip()) != len(b) - len(b.lstrip()) or a[:len(a) - len(a.lstrip())] != b[:len(b) - len(b.lstrip())]:
+        return False
+    if a.count('"') % 2 or a.count("'") % 2 or b.count('"') % 2 or b.count("'") % 2 or '"""' in a + b or "\'\'\'" in a + b:
+        return False  # part of a multi-line string: whitespace is data
+    if _canon(a) == _canon(b):
+        return True
+    return _canon(_norm_eq(a)) == _canon(_norm_eq(b))
 
 
 def key_of_text(s):
@@ -218,13 +257,8 @@ def select_mask(patch_text):
     files = parse_patch(patch_text)
     sel = 0
     for f, info in files.items():
-        if f.startswith("tests/") and f.endswith(".py"):
-            touched = set(info["old"]) | set(info["ins"])
-            hit = False
-            for a, b, i in TSPANS.get(f, ()):
-                if any(a <= l <= b for l in touched): sel |= 1 << i; hit = True
-            if not hit:
-                for a, b, i in TSPANS.get(f, ()): sel |= 1 << i
+        if f.startswith("tests/") and f.endswith(".py") and not f.startswith("tests/fixtures/"):
+            sel |= test_file_mask(f, info)
             continue
         if f.startswith("tests/"):
             m = FILES.get(f, 0)
@@ -241,6 +275,14 @@ def select_mask(patch_text):
             mod = f[:-3].replace("/", ".")
             for c, m in CLS_USE.items():
                 if c.startswith(mod + "."): sel |= m
+            continue
+        try:
+            verdict = file_verdict(f, info)
+        except Exception:
+            verdict = None
+        if verdict == "all":
+            sel |= _everything(); continue
+        if verdict == "none":
             continue
         # events: (old line, text, is_insert)
         equiv = {ln for ln, p in info["pair"].items() if equivalent(info["minus"][ln], p)}
@@ -419,6 +461,273 @@ def select_mask(patch_text):
     return sel
 
 
+import json as _json
+try:
+    TSTRUCT = _json.load(open(os.path.join(HERE, "test_struct.json")))
+except Exception:
+    TSTRUCT = {}
+ALL_IDS = None  # every test id in tests.json, set by main.py
+EXTRA_IDS = set()  # ids chosen by file / class outside the bitmask (tests the index does not number)
+
+
+def _all_ids():
+    return ALL_IDS or TESTS
+
+
+def _importers(f):
+    """test modules that import f, transitively (f included)"""
+    seen = {f}; stack = [f]
+    while stack:
+        g = stack.pop()
+        pkg = g.endswith("__init__.py") and g[:-len("__init__.py")]
+        for h, d in TSTRUCT.items():
+            if h in seen: continue
+            if g in d["imports"] or (pkg and h.startswith(pkg)):
+                seen.add(h); stack.append(h)
+    return seen
+
+
+def _class_family(names):
+    """class names plus every test class deriving from them (by base name, any module)"""
+    fam = set(names); changed = True
+    while changed:
+        changed = False
+        for d in TSTRUCT.values():
+            for c in d["classes"]:
+                if c["name"] not in fam and any(b in fam for b in c["bases"]):
+                    fam.add(c["name"]); changed = True
+    return fam
+
+
+def _ids_where(pred):
+    m = 0
+    pos = {t: i for i, t in enumerate(TESTS)}
+    for t in _all_ids():
+        if pred(t):
+            if t in pos: m |= 1 << pos[t]
+            else: EXTRA_IDS.add(t)
+    return m
+
+
+def test_file_mask(f, info):
+    """A test module edit. Inside a test: that test. Inside a test class but outside its tests
+    (setUp, helpers, class settings): every test of that class and its subclasses. Module level
+    (imports, helpers, constants): every test in the module and in the modules importing it."""
+    st = TSTRUCT.get(f)
+    spans = TSPANS.get(f, ())
+    events = [(ln, t, False) for ln, t in info["minus"].items()]
+    events += [(ln, t, True) for ln, ts in info["ins"].items() for t in ts]
+    if info.get("deleted"):
+        return _ids_where(lambda t: t.split("::")[0] in _importers(f))
+    try:
+        verdict = file_verdict(f, info)
+    except Exception:
+        verdict = None
+    if verdict == "none":
+        return 0
+    if verdict == "all":  # the module cannot be imported: it and its importers fail
+        return _ids_where(lambda t: t.split("::")[0] in _importers(f))
+    m = 0; fam = set(); module_level = False; defnames = set()
+    for ln, txt, is_ins in events:
+        hit = [i for a, b, i in spans if (a < ln <= b if is_ins else a <= ln <= b)]
+        if hit:
+            for i in hit: m |= 1 << i
+            continue
+        stripped = txt.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if st is None:
+            module_level = True; continue
+        cls = [c for c in st["classes"] if (c["a"] < ln <= c["b"] + (1 if is_ins else 0) if is_ins else c["a"] <= ln <= c["b"])]
+        if cls:
+            c = cls[0]
+            in_test = [mm for mm in c["methods"] if mm[0].startswith("test") and
+                       (mm[1] < ln <= mm[2] if is_ins else mm[1] <= ln <= mm[2])]
+            if in_test:
+                # a test the index does not number (skipped, renamed...): select it by id
+                for mm in in_test:
+                    m |= _ids_where(lambda t, n="%s::%s::%s" % (f, c["name"], mm[0]): t.split("[")[0] == n)
+                continue
+            if is_ins and re.match(r"\s*(async\s+)?def\s+test", txt):
+                continue  # a brand-new test is not in tests.json
+            fam.add(c["name"])
+            continue
+        d = [x for x in st.get("defs", ()) if x[1] <= ln <= x[2]]
+        if d:
+            defnames.add(d[0][0]); continue
+        module_level = True
+    if defnames and not module_level:
+        # a top-level helper / constant: this module, and importers that use the name (and so on)
+        def closure(g, ns):
+            # names in g whose definition reads a changed name change too
+            ns = set(ns); defs = TSTRUCT.get(g, {}).get("defs", ())
+            grew = True
+            while grew:
+                grew = False
+                for x in defs:
+                    if x[0] not in ns and len(x) > 3 and ns & set(x[3]):
+                        ns.add(x[0]); grew = True
+            return ns
+        files = {f}; frontier = [(f, closure(f, defnames))]
+        while frontier:
+            g, ns = frontier.pop()
+            for h, dh in TSTRUCT.items():
+                if h in files or g not in dh["imports"]: continue
+                used = ns & set(dh.get("names", ()))
+                if used or g.endswith("__init__.py"):
+                    files.add(h)
+                    # everything h defines may now behave differently
+                    frontier.append((h, {x[0] for x in dh.get("defs", ())} | {c["name"] for c in dh["classes"]}))
+        m |= _ids_where(lambda t: t.split("::")[0] in files)
+    if fam:
+        fam = _class_family(fam)
+        m |= _ids_where(lambda t: len(t.split("::")) > 2 and t.split("::")[1] in fam)
+    if module_level:
+        files = _importers(f)
+        m |= _ids_where(lambda t: t.split("::")[0] in files)
+    return m
+
+
+# ---- whole-file check against the pinned sources: syntax errors and changes the AST cannot see ----
+_SRC = None
+
+
+def _load_src():
+    global _SRC
+    if _SRC is None:
+        try:
+            _SRC = pickle.loads(gzip.decompress(open(os.path.join(HERE, "src.pkl.gz"), "rb").read()))
+        except Exception:
+            _SRC = {"src": {}, "spans": {}}
+    return _SRC
+
+
+def _src(f):
+    return _load_src()["src"].get(f)
+
+
+def rebuild(old, info):
+    """the patched file, or None when the patch does not fit the pinned source"""
+    lines = old.split("\n")
+    for n, t in info["minus"].items():
+        if n < 1 or n > len(lines) or lines[n - 1] != t:
+            return None
+    out = []
+    for n, l in enumerate(lines, 1):
+        out.extend(info["ins"].get(n, ()))
+        if n not in info["old"]:
+            out.append(l)
+    for n in sorted(k for k in info["ins"] if k > len(lines)):
+        out.extend(info["ins"][n])
+    return "\n".join(out)
+
+
+class _Norm(_ast.NodeTransformer):
+    """drop docstrings, and signature annotations when they are never evaluated"""
+
+    def __init__(self, strip_ann):
+        self.strip_ann = strip_ann
+
+    def _doc(self, node):
+        b = node.body
+        if b and isinstance(b[0], _ast.Expr) and isinstance(b[0].value, _ast.Constant) and isinstance(b[0].value.value, str):
+            node.body = b[1:]
+
+    def visit_Module(self, node):
+        self._doc(node); self.generic_visit(node); return node
+
+    def visit_ClassDef(self, node):
+        self._doc(node); self.generic_visit(node); return node
+
+    def visit_FunctionDef(self, node):
+        self._doc(node)
+        if self.strip_ann:
+            node.returns = None
+        self.generic_visit(node); return node
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_arg(self, node):
+        if self.strip_ann:
+            node.annotation = None
+        return node
+
+
+_FUTURE_ANN = re.compile(r"^from __future__ import [^\n]*\bannotations\b", re.M)
+
+
+def _future_ann(tree):
+    return any(isinstance(n, _ast.ImportFrom) and n.module == "__future__" and any(a.name == "annotations" for a in n.names)
+               for n in tree.body)
+
+
+def _segment(f, old, info):
+    """old and new text of the smallest def / class / statement that holds every change, dedented;
+    None when there is none (then the whole file is compared)"""
+    touched = list(info["old"]) + list(info["ins"])
+    if not touched:
+        return None
+    lo = min(touched); hi = max(touched)
+    lines = old.split("\n")
+    for a, b in _load_src()["spans"].get(f, ()):
+        # removed lines strictly after the header; insertions before a line inside the span
+        if not (a < lo and all(a < n <= b for n in info["old"]) and all(a < k <= b for k in info["ins"])):
+            continue
+        ind = lines[a - 1][:len(lines[a - 1]) - len(lines[a - 1].lstrip())]
+        changed = [info["minus"][n] for n in info["old"]] + [t for ts in info["ins"].values() for t in ts]
+        if any(t.strip() and not t.startswith(ind) for t in changed):
+            return None
+        olds = lines[a - 1:b]
+        news = []
+        for n in range(a, b + 1):
+            news.extend(info["ins"].get(n, ()))
+            if n not in info["old"]:
+                news.append(lines[n - 1])
+        cut = lambda xs: "\n".join(x[len(ind):] if x.startswith(ind) else x for x in xs)
+        return cut(olds), cut(news)
+    return None
+
+
+def file_verdict(f, info):
+    """"all": the patched file no longer parses, so importing it fails; "none": same program
+    (comments, formatting, docstrings, unevaluated annotations); None: look at the lines."""
+    old = _src(f)
+    if old is None or info.get("deleted") or info.get("new_file"):
+        return None
+    new = rebuild(old, info)
+    if new is None:
+        return None
+    seg = _segment(f, old, info)
+    if seg is not None:
+        a_txt, b_txt = seg
+        try:
+            t_a = _ast.parse(a_txt); t_b = _ast.parse(b_txt)
+        except (SyntaxError, ValueError):
+            pass  # decide on the whole file below
+        else:
+            strip = bool(_FUTURE_ANN.search(old))
+            if _ast.dump(_Norm(strip).visit(t_a)) == _ast.dump(_Norm(strip).visit(t_b)):
+                return "none"
+            return None
+    try:
+        t_new = _ast.parse(new)
+    except (SyntaxError, ValueError):
+        return "all"
+    try:
+        t_old = _ast.parse(old)
+    except SyntaxError:
+        return None
+    strip = _future_ann(t_old) and _future_ann(t_new)
+    if _ast.dump(_Norm(strip).visit(t_old)) == _ast.dump(_Norm(strip).visit(t_new)):
+        return "none"
+    return None
+
+
+def _everything():
+    EXTRA_IDS.update(t for t in _all_ids() if t not in set(TESTS))
+    return (1 << len(TESTS)) - 1
+
+
 LAZY_LOAD = "tests/dialects/test_dialect.py::TestDialect::test_lazy_load"
 TYPING_META = "tests/test_typing.py::TestTyping::test_no_redundant_expression_metadata"
 SQLGLOTC = ["tests/test_sqlglotc.py::TestSQLGlotC::test_build_removes_obsolete_extensions",
@@ -455,8 +764,10 @@ def extra_tests(patch_text):
 
 
 def select(patch_text):
+    EXTRA_IDS.clear()
     sel = select_mask(patch_text)
     res = [TESTS[i] for i in range(len(TESTS)) if sel >> i & 1]
+    res += [t for t in sorted(EXTRA_IDS) if t not in set(res)]
     try:
         for x in extra_tests(patch_text):
             if x not in res: res.append(x)

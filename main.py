@@ -22,6 +22,7 @@ def best_split(items):
 def main():
     tests = json.load(open(os.path.join(DATA, "tests.json")))["tests"]
     by_id = {t["id"]: t for t in tests}
+    S.ALL_IDS = [t["id"] for t in tests]
     zero_ms = [t["number"] for t in tests if round(t["seconds"] * 1000) == 0]
     cdir = os.path.join(DATA, "commits")
     out = []
