@@ -21,6 +21,16 @@ Selects which sqlglot tests a patch can break, using maps built from the pinned 
 | one-line dict (`{"x": ..., "u": ...}`) | only the entry whose columns changed |
 | `sqlglot/typing/`, core imports, `sqlglotc/` | also the few tests that work in subprocesses or read source files |
 
+| any `sqlglot/` or `tests/` `.py` file | rebuilt from the bundled pinned sources (`src.pkl.gz`) and each changed region compared as an AST inside its smallest enclosing def / statement: a file that no longer parses selects every test; an identical AST (comments, formatting, parentheses, docstrings, annotations under `from __future__ import annotations`) selects nothing |
+| test module outside a test (`setUp`, helpers, `Validator`) | every test of that class and its subclasses; module level (`tests/helpers.py`...): the module and the importers that use the changed name |
+| class header (`class X(Base):`) | every test that uses the class or a subclass |
+| decorator added above an existing def | every test that ran that def |
+| new module-level def / class / import | lines using a name it shadows (and the module's classes when the name is also used at import time); `from sqlglot.x import y` of a missing name counts as the module failing to import |
+| pure rename | the old path counts as deleted |
+
+Line comparison (`equivalent`) is whitespace-insensitive only between tokens: indentation and the text of string
+literals must match exactly.
+
 Once a commit has a worker, every test recorded at 0 ms is added too: it costs nothing and
 can only prevent a miss.
 
@@ -34,7 +44,9 @@ that minimises `max load + 2 s x workers`.
 ## Files
 
 - `main.py`, `select_tests.py`: the selector (standard library only)
-- `index.pkl.gz`: the maps (about 2.4 MB)
+- `index.pkl.gz`: the maps (about 2.4 MB); `prep_index.py` decompresses it and precomputes derived tables at image build
+- `src.pkl.gz`: pinned sqlglot + test sources and statement spans (`tools/build_src.py`)
+- `test_struct.json`: test-module imports, classes, helpers (`tools/build_test_struct.py`)
 - `tools/`: scripts that build the maps from the pinned commit
 
 ## Rebuilding the maps
