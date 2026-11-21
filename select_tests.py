@@ -507,6 +507,15 @@ def select_mask(patch_text):
                         m = attr_mask(cq, attr)
                     sel |= m
                 continue
+            # 3a) a class header (bases, keywords, name): every test using the class or a subclass
+            if re.match(r"\s*class\s", txt):
+                hdr = [x for x in STRUCT.get(f, ()) if x[2] == "class" and x[0] <= ln <= x[0] + 3]
+                for x in hdr:
+                    sel |= class_use(x[3]) | expr_mask(x[3])
+                if hdr or not is_ins:
+                    if not hdr and inner and inner[2] == "class":
+                        sel |= class_use(inner[3])
+                    continue
             # 3) new method / attr inserted directly in a class body
             if inner and inner[2] == "class":
                 cq = inner[3]
