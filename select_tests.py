@@ -1164,6 +1164,12 @@ def _child_import(table, mods):
         os.dup2(dn, 1); os.dup2(dn, 2)
         import importlib
         table.update(_child_import.pending)
+        if mods == ["@maxnodes"]:
+            import json as _j
+            base = _j.load(open(os.path.join(HERE, "maxnodes_base.json")))
+            sys.path.insert(1, HERE)
+            import maxnodes_child
+            os._exit(0 if maxnodes_child.check(base) else 1)
         if mods == ["@tpcds"]:
             g = _gate()
             sys.path.insert(1, HERE)
@@ -1486,6 +1492,38 @@ def tpcds_gate_drops(files):
         _GATE_SPENT[0] += time.time() - t0
 
 
+MAXNODES = "tests/test_parser.py::TestParser::test_max_nodes"
+
+
+def maxnodes_gate_drops(files):
+    """test_max_nodes (28.8 s) parses a 10000-column query against node limits. Replay it scaled down
+    (maxnodes_child.py) with the patched sources swapped in; True when every result tree, exception and
+    message matches the pinned sqlglot's"""
+    if not os.path.exists(os.path.join(HERE, "maxnodes_base.json")) or _GATE_SPENT[0] > GATE_BUDGET:
+        return False
+    patched = {}
+    for f, info in files.items():
+        if not (f.startswith("sqlglot/") and f.endswith(".py")) or info.get("deleted") or info.get("new_file"):
+            return False
+        v = file_verdict(f, info)
+        if v == "none":
+            continue
+        if v == "all":
+            return False
+        new = rebuild(_src(f), info)
+        if new is None:
+            return False
+        patched[f] = new
+    if not patched:
+        return True
+    import time
+    t0 = time.time()
+    try:
+        return not _imports_fail(patched, ["@maxnodes"])
+    finally:
+        _GATE_SPENT[0] += time.time() - t0
+
+
 # ---- class construction: function bodies that run while classes are built at import (metaclass __new__,
 # __init_subclass__, helpers called from class bodies). Coverage credits them to whichever test imported
 # first, but what they compute lives on the classes: select the users of those classes ----
@@ -1583,6 +1621,12 @@ def select(patch_text):
         try:
             if tpcds_gate_drops(files):
                 res.remove(TPCDS_EXEC)
+        except Exception:
+            pass
+    if MAXNODES in res and not widened:
+        try:
+            if maxnodes_gate_drops(files):
+                res.remove(MAXNODES)
         except Exception:
             pass
     res += [t for t in sorted(EXTRA_IDS) if t not in set(res)]

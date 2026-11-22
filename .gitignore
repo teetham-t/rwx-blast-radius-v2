@@ -4,3 +4,4 @@ __pycache__/
 words.pkl
 sg/
 tpcds_base.json
+maxnodes_base.json

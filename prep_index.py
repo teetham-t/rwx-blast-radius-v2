@@ -75,3 +75,6 @@ import subprocess, sys
 subprocess.run([sys.executable, "-S", os.path.join(HERE, "tpcds_gate_child.py"), os.path.join(HERE, "sg"),
                 os.path.join(HERE, "tpcds_gate.json.gz"), os.path.join(HERE, "tpcds_base.json")], check=True,
                stderr=subprocess.DEVNULL)
+# baseline for the test_max_nodes gate (scaled replica, same code as the runtime check)
+subprocess.run([sys.executable, "-S", os.path.join(HERE, "maxnodes_child.py"), os.path.join(HERE, "sg"),
+                os.path.join(HERE, "maxnodes_base.json")], check=True, stderr=subprocess.DEVNULL)
