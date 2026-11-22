@@ -1411,7 +1411,7 @@ def tpcds_gate_drops(files):
     G = _gate()
     if not G or _GATE_SPENT[0] > GATE_BUDGET:
         return False
-    patched = {}; need_stages = set(); all_queries = False
+    patched = {}; need_stages = set(); all_queries = False; full = False
     for f, info in files.items():
         if not (f.startswith("sqlglot/") and f.endswith(".py")) or info.get("deleted") or info.get("new_file"):
             return False
@@ -1429,9 +1429,11 @@ def tpcds_gate_drops(files):
                     return False
                 patched[f] = new; need_stages.add("o"); all_queries = True
             continue
+        if f.startswith("sqlglot/executor/"):
+            return False
         spans = SPANS.get(f, ())
         if not all(any(a < x <= b for a, b, _ in spans) for x in set(info["old"]) | set(info["ins"])):
-            return False
+            full = True  # outside function bodies: check every stage over every query instead of giving up
         st = G.get("stages", {}).get(f, {})
         # the stage trace starts after imports: a line that runs at import (package import, the executor
         # tests' collection, class construction) is invisible to it, so it blocks the gate
@@ -1445,12 +1447,12 @@ def tpcds_gate_drops(files):
         cbl = CB["lines"].get(f, {})
         for x in _touched(f, info):
             if x in imp:
-                return False
+                full = True  # runs at import: the child re-imports patched, so check every stage and query
             if x in cbl:
                 built = CB["groups"][cbl[x]]
                 # building DuckDB classes only feeds the duckdb side, which the child re-imports patched
                 if not all(k.startswith(_DUCK_PREFIXES) for k in built):
-                    return False
+                    full = True
                 need_stages.add("d")
         for x in _touched(f, info):
             code = st.get(str(x), "")
@@ -1461,6 +1463,8 @@ def tpcds_gate_drops(files):
         if new is None:
             return False
         patched[f] = new
+    if full:
+        need_stages |= set("pod"); all_queries = True
     if not patched:
         return not need_stages  # only dialect type tables changed: nothing this test runs reads them
     per = G.get("per_query")
